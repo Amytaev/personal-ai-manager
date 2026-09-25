@@ -3,13 +3,15 @@ python-dotenv
 apscheduler
 anthropic
 
+# --- Phase 3 (Telegram Bot) - actually used now ---
+python-telegram-bot>=21,<22
+
 # --- Testing ---
 pytest
 pytest-asyncio
 pytest-mock
 
 # --- Future phases (listed here for reference, not yet imported by any code) ---
-# python-telegram-bot   # Phase 3: Telegram bot
 # playwright            # Phase 5: Teams browser automation fallback
 # httpx                 # Phase 4/6: Weather + VALORANT HTTP clients
-# keyring               # Phase 3/5: DPAPI-backed secret storage on Windows
+# keyring               # Phase 3/5: DPAPI-backed secret storage on Windows (see note below)

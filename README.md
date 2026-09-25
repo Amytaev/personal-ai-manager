@@ -1,30 +1,37 @@
 # Personal AI Manager
 
 Локальная система персональной автоматизации (Teams / Weather / VALORANT →
-AI Manager → Telegram). Полное ТЗ см. `TZ_v4.md` (не входит в этот архив —
-хранится отдельно).
+AI Manager → Telegram). Полное ТЗ см. `TZ_v4.md` (хранится отдельно).
 
-**Текущее состояние: Phase 2 — Core Infrastructure.** Ни один из трёх
-агентов (Teams/Weather/VALORANT), Telegram-бот и сам AI Manager ещё **не
-реализованы** — это Phase 3–7. Phase 2 строит только фундамент, на
-котором они будут собраны.
+**Текущее состояние: Phase 3 — Core Infrastructure + Telegram Bot.**
+Teams / Weather / VALORANT агенты и сам AI Manager ещё **не реализованы**
+(Phase 4-7) — команды бота, которые должны показывать их данные, честно
+читают из (пока пустых) SQLite-таблиц и говорят "агент не реализован",
+а не выдумывают ответ.
 
 ## Что уже есть
 
 | Компонент | Файл | Статус |
 | --- | --- | --- |
-| BaseAgent + структурированный результат + error isolation | `agents/base.py` | ✅ реализовано, протестировано |
-| SQLite схема (tasks/weather_snapshots/valorant_store/notifications/agent_runs) | `storage/models.py` | ✅ |
-| Storage layer (connection, agent_runs, dedup, retention cleanup) | `storage/database.py` | ✅ реализовано, протестировано |
-| Scheduler foundation + single-instance guard + graceful shutdown | `scheduler/scheduler.py` | ✅ реализовано, протестировано |
-| Retry/backoff декоратор | `utils/retry.py` | ✅ реализовано, протестировано |
-| LLM provider abstraction (Anthropic + Null fallback) | `llm/provider.py` | ✅ реализовано, протестировано |
-| Конфигурация из `.env` | `config.py` | ✅ |
-| Логирование (rotating file + console, без credentials) | `logging_config.py` | ✅ |
-| Entrypoint, связывающий всё вместе | `run.py` | ✅ (без агентов — просто держит lock, крутит scheduler с одной задачей retention cleanup, корректно завершается) |
-| **Teams / Weather / VALORANT агенты** | `agents/` | ⏳ Phase 4/5/6 |
-| **AI Manager** (aggregation/priority/LLM summary) | `manager/` | ⏳ Phase 7 (сейчас только заглушка с комментарием) |
-| **Telegram bot** | `telegram/` | ⏳ Phase 3 (сейчас только заглушка с комментарием) |
+| BaseAgent + структурированный результат + error isolation | `agents/base.py` | ✅ Phase 2 |
+| SQLite схема + storage layer (dedup, retention) | `storage/models.py`, `storage/database.py` | ✅ Phase 2 |
+| Scheduler + single-instance guard + graceful shutdown | `scheduler/scheduler.py` | ✅ Phase 2 |
+| Retry/backoff, LLM provider abstraction | `utils/retry.py`, `llm/provider.py` | ✅ Phase 2 |
+| **Telegram bot**: все команды из ТЗ | `telegram_bot/handlers.py` | ✅ Phase 3 |
+| **chat_id авторизация** (single-user) | `telegram_bot/auth.py` | ✅ Phase 3 |
+| **Wishlist** (JSON, /addskin /removeskin /wishlist) | `storage/wishlist.py` | ✅ Phase 3 |
+| **Дедуплицированные уведомления** (`notify()`) | `telegram_bot/bot.py` | ✅ Phase 3, механизм готов, реальных вызовов пока нет (это Phase 7) |
+| Startup/shutdown бота вместе со scheduler | `run.py` | ✅ Phase 3 |
+| Teams / Weather / VALORANT агенты | `agents/` | ⏳ Phase 4/5/6 |
+| AI Manager (aggregation/priority/LLM summary) | `manager/` | ⏳ Phase 7 |
+
+## Команды бота
+
+`/start /help /status /tasks /weather /store /briefing /wishlist /addskin /removeskin`
+
+Каждая команда сначала проверяет `incoming_chat_id == TELEGRAM_CHAT_ID`
+(`telegram_bot/auth.py`) — чужой chat не получает вообще никакого ответа,
+даже отказа.
 
 ## Установка
 
@@ -35,9 +42,9 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Заполни `.env` — на этом этапе реально нужен только `LLM_API_KEY`, если
-хочешь проверить `AnthropicProvider` (без него используется `NullProvider`,
-тесты и `run.py` работают и так).
+Заполни `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID` в `.env`, чтобы бот
+реально стартовал (без них `run.py` работает как в Phase 2, без бота,
+с явным предупреждением в логе).
 
 ## Запуск
 
@@ -45,56 +52,69 @@ copy .env.example .env
 python run.py
 ```
 
-Поднимет логирование, займёт single-instance lock, запустит scheduler с
-единственной задачей — ежедневной retention-очисткой БД (`DATA_RETENTION_DAYS`,
-по умолчанию 30 дней) — и будет висеть, ожидая Ctrl+C. Повторный запуск
-второй копии откажет с понятным сообщением (`Application already running`).
-
 ## Тесты
 
 ```powershell
 pytest -q
 ```
 
-17 тестов, все проходят. Покрытие: BaseAgent/error isolation, storage
-(schema/dedup/retention), single-instance guard, retry/backoff, LLM
-provider selection.
+**43 теста, все проходят** (17 из Phase 2 + 26 новых в Phase 3): auth-декоратор
+(авторизован/не авторизован/сравнение int-vs-str chat_id), wishlist
+(add/remove/dedup/повреждённый файл), все хендлеры команд на реальной
+tmp-БД с замоканным Telegram `Update`, и дедупликация `notify()`
+(включая кейс "отправка упала — не должно помечаться как отправленное").
 
-## Известный нюанс: graceful shutdown на Windows
+### ⚠️ Что НЕ было проверено вживую и почему
 
-`asyncio.loop.add_signal_handler()` **не реализован на Windows вообще**
-(`NotImplementedError` на дефолтном event loop) — при этом Windows 11
-целевая платформа проекта. Поэтому:
+В этой среде разработки исходящий сетевой доступ ограничен списком
+доменов, `api.telegram.org` туда не входит (подтверждено: попытка
+запроса возвращает `403 Forbidden` от egress-прокси мгновенно, не
+зависает). Это значит: **реальный long-polling против настоящего
+Telegram API здесь физически невозможно проверить** — ни моими
+силами, ни любым другим инструментом в этом контейнере.
 
-- **SIGTERM** обрабатывается через `add_signal_handler` — работает на
-  Linux/Mac (для разработки), молча пропускается на Windows.
-- **Ctrl+C (SIGINT)** работает на всех платформах, включая Windows, через
-  штатный механизм `asyncio.run()`: он сам превращает `KeyboardInterrupt`
-  в отмену (`CancelledError`) текущей задачи, поэтому cleanup-код в
-  `run.py` находится в голом `finally` (а не в `except KeyboardInterrupt`
-  внутри корутины — это была реальная ошибка в первой версии, поймана и
-  исправлена при тестировании: `finally` отрабатывает при любом типе
-  исключения, `except KeyboardInterrupt` внутри `await` — нет).
+Всё, что можно было проверить без сети, проверено по-настоящему:
+- сборка `Application` из токена (`Application.builder().token(...).build()`)
+  не делает сетевых вызовов — протестировано;
+- вся бизнес-логика хендлеров (что бот ОТВЕЧАЕТ на каждую команду)
+  протестирована с замоканным `Update`/`Context`;
+- **сценарий реального сбоя запуска бота я воспроизвёл по-настоящему**:
+  запустил `run.py` с fake-токеном, получил настоящую сетевую ошибку от
+  заблокированного `api.telegram.org` — и именно так нашёл и исправил
+  реальный баг (см. ниже).
 
-Проверено вручную: сигнал доставляется, весь cleanup (лог "Shutdown
-complete", закрытие scheduler, снятие lock-файла) отрабатывает до выхода
-процесса, без зависаний и без "грязного" traceback.
+**Тебе нужно самому один раз прогнать `python run.py` с настоящим
+`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` на своей машине** и вручную
+проверить каждую команду в самом Telegram — это единственный способ
+закрыть этот пробел, я не могу сделать это за тебя из песочницы.
 
-Для Phase 8 (запуск как служба через NSSM/pywin32/Task Scheduler — см.
-Phase 1 Architecture Review) может понадобиться отдельно проверить, как
-именно каждый из трёх вариантов доставляет stop-сигнал процессу на
-Windows — это не то же самое, что Ctrl+C в интерактивной консоли.
+## Два реальных бага, найденных и исправленных при тестировании
 
-## Технический долг / что сознательно не сделано в Phase 2
+1. **`telegram/` как имя пакета конфликтует с самой библиотекой
+   `python-telegram-bot`** (она импортируется как `import telegram`).
+   Изначальная структура из ТЗ (`telegram/bot.py` и т.д.) ломает импорт
+   стороннего пакета — Python видит наш локальный `telegram/` раньше
+   установленного. Переименовал в **`telegram_bot/`** — это единственное
+   отступление от структуры ТЗ, и оно вынужденное, не косметическое.
+2. **Падение `bot.start()` (нет сети / неверный токен) оставляло
+   lock-файл висеть навсегда.** Cleanup был только вокруг
+   `stop_event.wait()`, а не вокруг всего старта — если бот падал ДО
+   этой точки, `guard.release()` просто не вызывался. Следующий запуск
+   получал ложное "Application already running" при отсутствии
+   реального процесса. Исправлено: весь блок старта (scheduler + bot)
+   теперь внутри одного `try`, `finally` очищает bot/scheduler/lock по
+   отдельности (сбой одного шага очистки не блокирует остальные) —
+   воспроизведено и перепроверено вручную до и после фикса.
 
-- `manager/` и `telegram/` — только заглушки с докстрингом, отсылающим к
-  своей фазе. Пустых классов-болванок специально не создавал, чтобы не
-  плодить код, который придётся переписывать в Phase 3/7.
-- `requirements.txt` содержит закомментированный список зависимостей
-  будущих фаз (`python-telegram-bot`, `playwright`, `httpx`, `keyring`) —
-  не установлены и не импортируются нигде в Phase 2, добавлены только как
-  справка.
-- `DATA_RETENTION_DAYS` очищает `weather_snapshots` и `agent_runs` по
-  времени; `tasks`/`notifications` сознательно не трогает (см. коммент в
-  `storage/database.py`) — они по ТЗ живут по другой логике (учебный
-  период / дедупликация), которая появится вместе с Teams-агентом.
+## Технический долг / сознательно не сделано в Phase 3
+
+- `notify()` в `telegram_bot/bot.py` реализован и протестирован
+  (dedup через ту же таблицу `notifications`, что и в Phase 2), но
+  реальных вызовов пока нет — их добавит AI Manager в Phase 7, когда
+  появятся события, о которых нужно проактивно уведомлять.
+- `/status`, `/tasks`, `/weather`, `/store`, `/briefing` читают сырые
+  данные из SQLite напрямую, без приоритизации/LLM-форматирования —
+  это Phase 7.
+- Webhook-режим не рассматривался, используется long-polling
+  (`updater.start_polling()`) — для личного бота с одним пользователем
+  этого достаточно, вебхук потребовал бы публичного HTTPS-эндпоинта.

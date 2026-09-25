@@ -49,6 +49,7 @@ class AppConfig:
     database_path: str
     log_dir: str
     lock_file_path: str
+    wishlist_path: str
 
 
 def load_config() -> AppConfig:
@@ -70,4 +71,5 @@ def load_config() -> AppConfig:
         database_path=os.getenv("DATABASE_PATH", "data/agent.db"),
         log_dir=os.getenv("LOG_DIR", "logs"),
         lock_file_path=os.getenv("LOCK_FILE_PATH", "data/.instance.lock"),
+        wishlist_path=os.getenv("WISHLIST_PATH", "config/wishlist.json"),
     )

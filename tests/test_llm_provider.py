@@ -25,6 +25,7 @@ def _config(**overrides) -> AppConfig:
         database_path="data/agent.db",
         log_dir="logs",
         lock_file_path="data/.instance.lock",
+        wishlist_path="config/wishlist.json",
     )
     base.update(overrides)
     return AppConfig(**base)
