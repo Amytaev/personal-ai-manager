@@ -1,0 +1,23 @@
+# Secrets - never commit
+.env
+
+# Local runtime data
+data/*.db
+data/.instance.lock
+logs/*.log
+logs/*.log.*
+
+# Keep folder structure without committing their contents
+!data/.gitkeep
+!logs/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Playwright persistent browser profile (Phase 5) - contains session cookies
+browser_profile/

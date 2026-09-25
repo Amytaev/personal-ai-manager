@@ -1,0 +1,15 @@
+# --- Phase 2 (Core Infrastructure) - actually used now ---
+python-dotenv
+apscheduler
+anthropic
+
+# --- Testing ---
+pytest
+pytest-asyncio
+pytest-mock
+
+# --- Future phases (listed here for reference, not yet imported by any code) ---
+# python-telegram-bot   # Phase 3: Telegram bot
+# playwright            # Phase 5: Teams browser automation fallback
+# httpx                 # Phase 4/6: Weather + VALORANT HTTP clients
+# keyring               # Phase 3/5: DPAPI-backed secret storage on Windows
