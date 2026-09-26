@@ -13,6 +13,7 @@ logs/*.log.*
 # something to commit.
 data/teams_last_failure.png
 data/teams_diagnose_*.png
+data/sso_diagnose_*.png
 
 # Keep folder structure without committing their contents
 !data/.gitkeep
