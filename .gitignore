@@ -7,10 +7,12 @@ data/.instance.lock
 logs/*.log
 logs/*.log.*
 
-# Failure-diagnostic screenshot (agents/teams/agent.py) - can show real
-# account/tenant info on the Microsoft login screen, never a password,
-# but still not something to commit.
+# Failure-diagnostic screenshots (agents/teams/agent.py,
+# scripts/teams_diagnose_reauth.py) - can show real account/tenant info
+# on the Microsoft login screen, never a password, but still not
+# something to commit.
 data/teams_last_failure.png
+data/teams_diagnose_*.png
 
 # Keep folder structure without committing their contents
 !data/.gitkeep
