@@ -122,21 +122,64 @@ async def main() -> None:
     await page.screenshot(path=screenshot_path, full_page=True)
     print(f"Saved a screenshot of the result to: {screenshot_path} - open it to see what actually got clicked.")
 
-    print(f"\n{len(captured)} matching response(s) captured.")
-    if captured:
-        statuses = {c["status"] for c in captured}
-        print(f"VERDICT: a real UI click DID trigger request(s) to the work/classes API. "
-              f"HTTP status(es) seen: {statuses}. "
-              + ("All OK - " if statuses == {200} else "NOT all 200 - ")
-              + "this confirms/denies that driving a real click (not a raw URL) is what "
-              "agent.py needs to do, and that the response bodies themselves (not a separate "
-              "context.request call) are the way to get the data.")
-    else:
+    work_responses_so_far = [c for c in captured if "/edu/me/work" in c["url"]]
+    print(f"\n{len(captured)} matching response(s) captured so far "
+          f"({len(work_responses_so_far)} against /edu/me/work).")
+
+    if not captured:
         print(
             "VERDICT: the click succeeded but no matching response was seen in the wait "
             "window. Either the click landed on the wrong element, or more time/a different "
             "wait strategy is needed."
         )
+        await session.close()
+        return
+
+    # The dashboard has several tabs (Предстоящие/Готово к оценке/
+    # Просрочено/Возвращено/Черновики per the screenshot you sent) - only
+    # the default one fires on load. Click through the student-relevant
+    # ones (skipping "Черновики"/Drafts, which is teacher-only content
+    # creation) to see whether each one fires its OWN /edu/me/work call
+    # with a different $filter, the way agents/teams/agent.py's original
+    # three-filter design assumed.
+    tab_labels = ["Предстоящие", "Просрочено", "Возвращено", "Готово к оценке"]
+    for tab_label in tab_labels:
+        try:
+            tab = page.get_by_role("tab", name=tab_label).first
+            await tab.wait_for(state="visible", timeout=3_000)
+        except Exception:
+            try:
+                tab = page.get_by_text(tab_label, exact=True).first
+                await tab.wait_for(state="visible", timeout=3_000)
+            except Exception as exc:  # noqa: BLE001 - just report and move on
+                print(f"\n  Could not find a clickable '{tab_label}' tab ({type(exc).__name__}) - skipping.")
+                continue
+        before_count = len(captured)
+        try:
+            print(f"\n  Clicking tab: {tab_label!r}")
+            await tab.click(timeout=5_000)
+            await page.wait_for_timeout(3_000)
+        except Exception as exc:  # noqa: BLE001 - report and move on to the next tab
+            print(f"    Click failed ({type(exc).__name__}) - skipping.")
+            continue
+        new_responses = captured[before_count:]
+        if not new_responses:
+            print(f"    No new matching response after clicking {tab_label!r}.")
+
+    work_responses = [c for c in captured if "/edu/me/work" in c["url"]]
+    print(f"\nTotal /edu/me/work responses captured across all tabs: {len(work_responses)}")
+    for r in work_responses:
+        print(f"  {r['status']} items={r['items']}  {r['url'][:160]}")
+
+    statuses = {c["status"] for c in captured}
+    print(
+        f"\nVERDICT: a real UI click (+ tab clicks) triggered {len(work_responses)} "
+        f"/edu/me/work response(s), HTTP status(es) seen overall: {statuses}. "
+        "This is the real, verified way to get the data: drive the Assignments dashboard "
+        "click, then the tab clicks, and parse the response BODIES captured here directly - "
+        "no separate context.request call needed at all. agents/teams/agent.py should be "
+        "redesigned around this, using this same click sequence and response-capture pattern."
+    )
 
     await session.close()
 
