@@ -1,10 +1,14 @@
 """Command handlers (TZ v4 §23-27).
 
-None of these call a Teams/Weather/VALORANT agent - those don't exist
-yet (Phase 4/5/6), and neither does the AI Manager's aggregation/
-priority/LLM summary logic (Phase 7). Commands that would show agent
-data read straight from the SQLite tables Phase 2 already built, and
-report honestly when there's nothing there yet instead of pretending.
+None of these call an agent directly - Teams (Phase 5) and Weather
+(Phase 4) agents run on the scheduler in run.py and write to SQLite;
+VALORANT (Phase 6) doesn't exist yet, and neither does the AI
+Manager's aggregation/priority/LLM summary logic (Phase 7). Commands
+that would show agent data read straight from the SQLite tables Phase
+2 already built, and report honestly when there's nothing there yet
+instead of pretending - "нет данных" is now genuinely ambiguous
+between "agent not implemented" and "implemented but hasn't run/found
+anything yet", so the messages below say which one it is per agent.
 """
 from __future__ import annotations
 
@@ -20,8 +24,10 @@ from storage.wishlist import WishlistStore
 
 logger = logging.getLogger(__name__)
 
-# The three agents named in the TZ - not yet implemented, but /status
-# reports on them by name so the shape of the command is already right.
+# The three agents named in the TZ. teams (Phase 5) and weather (Phase 4)
+# are implemented and run on the scheduler; valorant (Phase 6) isn't yet -
+# /status reports on all three by name regardless, so the shape of the
+# command is already right and "never ran" reads the same either way.
 KNOWN_AGENTS = ("teams", "weather", "valorant")
 
 STATUS_MARKERS = {"working": "\u2705", "degraded": "\U0001f7e1", "failing": "\U0001f534"}
@@ -60,7 +66,8 @@ class Handlers:
         for agent in KNOWN_AGENTS:
             row = self.db.last_run(agent)
             if row is None:
-                lines.append(f"\u26aa {agent}: ещё не запускался (агент не реализован)")
+                not_implemented = " (агент не реализован)" if agent == "valorant" else ""
+                lines.append(f"\u26aa {agent}: ещё не запускался{not_implemented}")
             else:
                 marker = STATUS_MARKERS.get(row["status"], "\u2753")
                 lines.append(f"{marker} {agent}: {row['status']} (проверка {row['finished_at']})")
@@ -73,7 +80,8 @@ class Handlers:
             ).fetchall()
         if not rows:
             await update.message.reply_text(
-                "Заданий пока нет — Teams Agent ещё не реализован (Phase 5)."
+                "Заданий пока нет — Teams Agent либо ещё не запускался, либо запускался "
+                "неудачно (нет доступа к сессии). Проверь /status: teams."
             )
             return
         lines = [
@@ -127,7 +135,7 @@ class Handlers:
         parts.append(
             f"\U0001f4da Учёба: {task_count} заданий в базе"
             if task_count
-            else "\U0001f4da Учёба: данных нет (Teams Agent не реализован)"
+            else "\U0001f4da Учёба: данных нет (Teams Agent ещё не запускался/не смог авторизоваться)"
         )
         parts.append(
             f"\U0001f324 Погода: обновлено {weather_row['created_at']}"

@@ -58,6 +58,52 @@ class Database:
                 (agent,),
             ).fetchone()
 
+    # -- tasks (Teams Agent, Phase 5) ------------------------------------
+
+    def get_task_fingerprint(self, task_id: str) -> sqlite3.Row | None:
+        """The subset of a task's stored fields that matter for change
+        detection (agents/teams/agent.py decides new/changed/unchanged
+        by comparing this against a freshly parsed row)."""
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT status, due_at, submitted_at, title FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+
+    def upsert_task(self, task: dict, state: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO tasks
+                    (id, course, title, description, status, created_at, due_at,
+                     submitted_at, source, state, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    course=excluded.course,
+                    title=excluded.title,
+                    description=excluded.description,
+                    status=excluded.status,
+                    due_at=excluded.due_at,
+                    submitted_at=excluded.submitted_at,
+                    state=excluded.state,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    task["id"],
+                    task["course"],
+                    task["title"],
+                    task.get("description"),
+                    task["status"],
+                    task.get("created_at"),
+                    task.get("due_at"),
+                    task.get("submitted_at"),
+                    task["source"],
+                    state,
+                    now,
+                ),
+            )
+
     # -- notifications (dedup, TZ v4 §20/§22) ----------------------------
 
     def was_notified(self, kind: str, dedupe_key: str) -> bool:

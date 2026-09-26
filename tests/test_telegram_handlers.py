@@ -49,11 +49,14 @@ async def test_status_reflects_a_recorded_agent_run(handlers, tmp_db):
 
 @pytest.mark.asyncio
 async def test_tasks_honest_when_empty(handlers):
+    # Teams Agent is implemented (Phase 5) - an empty tasks table now
+    # honestly means "hasn't run yet / couldn't authenticate", not "not
+    # implemented", so this checks for that distinction instead.
     update, context = _fake_update_and_context()
     await handlers.tasks(update, context)
 
     text = update.message.reply_text.call_args.args[0]
-    assert "не реализован" in text
+    assert "не запускался" in text
 
 
 @pytest.mark.asyncio
@@ -96,7 +99,7 @@ async def test_briefing_reports_all_three_sections_as_empty(handlers):
     await handlers.briefing(update, context)
 
     text = update.message.reply_text.call_args.args[0]
-    assert "Teams Agent не реализован" in text
+    assert "Teams Agent ещё не запускался" in text
     assert "Weather Agent не реализован" in text
     assert "VALORANT Agent не реализован" in text
 
