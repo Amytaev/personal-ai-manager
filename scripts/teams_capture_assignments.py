@@ -44,7 +44,14 @@ CAPTURE_DIR = Path("teams_capture")
 # Deliberately broad and case-insensitive - better to capture a bit too
 # much (and skim/discard) than to miss the one endpoint that matters
 # because of an overly narrow guess.
-INTERESTING_SUBSTRINGS = ("assignment", "gradebook", "grade", "coursework", "submission")
+#
+# "class"/"team" added after the first real capture: assignment objects
+# only carry a classId (GUID), never a course display name, so we need
+# whatever endpoint resolves classId -> course name too.
+INTERESTING_SUBSTRINGS = (
+    "assignment", "gradebook", "grade", "coursework", "submission",
+    "class", "team",
+)
 
 
 def _looks_interesting(url: str) -> bool:
