@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from config import AppConfig
@@ -27,6 +29,7 @@ def _config(**overrides) -> AppConfig:
         lock_file_path="data/.instance.lock",
         wishlist_path="config/wishlist.json",
         teams_profile_path="data/teams_browser_profile",
+        teams_min_due_date=datetime(2026, 9, 1, tzinfo=timezone.utc),
     )
     base.update(overrides)
     return AppConfig(**base)

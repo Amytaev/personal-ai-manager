@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from agents.teams.parser import (
     compute_status,
     parse_assignment,
+    parse_due,
     parse_work_response,
     resolve_course_name,
 )
@@ -149,3 +150,14 @@ def test_parse_work_response_empty_or_malformed_body_returns_empty_list():
     assert parse_work_response({}, now=NOW) == []
     assert parse_work_response({"value": "not-a-list"}, now=NOW) == []
     assert parse_work_response(None, now=NOW) == []  # type: ignore[arg-type]
+
+
+def test_parse_due_parses_a_real_zulu_timestamp():
+    due = parse_due("2026-10-03T14:30:00Z")
+    assert due == datetime(2026, 10, 3, 14, 30, 0, tzinfo=timezone.utc)
+
+
+def test_parse_due_handles_missing_or_malformed_values():
+    assert parse_due(None) is None
+    assert parse_due("") is None
+    assert parse_due("not-a-real-date") is None

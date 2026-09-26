@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -247,3 +248,60 @@ async def test_aclose_only_closes_a_session_it_owns(tmp_db):
     injected_agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
     await injected_agent.aclose()
     env.session.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_drops_stale_tasks_before_saving_when_min_due_date_is_set(tmp_db):
+    # Real data: an old/stale-semester class (unresolved classId
+    # 46191dc6) turned out to be using "Задания" as an announcements
+    # channel, all dated April 2026 - config.py's TEAMS_MIN_DUE_DATE
+    # exists specifically to keep noise like this out of the DB.
+    old = _assignment("old-1", "46191dc6-0000-0000-0000-000000000000", dueDateTime="2026-04-22T17:59:00Z")
+    recent = _assignment("new-1", "e3f75118-bae6-4636-87c7-b2e91b63f913", dueDateTime="2026-09-15T18:59:00Z")
+    env = _Env(tab_bodies={0: {"value": [old, recent]}})
+    agent = TeamsAgent(
+        profile_dir="unused",
+        db=tmp_db,
+        session=env.session,
+        min_due_date=datetime(2026, 9, 1, tzinfo=timezone.utc),
+    )
+
+    result = await agent.run()
+
+    assert result.status == AgentStatus.WORKING
+    assert result.data["total"] == 1
+    assert result.data["dropped_stale"] == 1
+    with tmp_db.connect() as conn:
+        ids = {r["id"] for r in conn.execute("SELECT id FROM tasks").fetchall()}
+    assert ids == {"new-1"}
+
+
+@pytest.mark.asyncio
+async def test_run_keeps_tasks_with_no_due_date_even_with_min_due_date_set(tmp_db):
+    # There's no date to judge the age of an undated task by, so it's
+    # kept rather than silently dropped - see agent.py's comment.
+    undated = _assignment("undated-1", "e3f75118-bae6-4636-87c7-b2e91b63f913", dueDateTime=None)
+    env = _Env(tab_bodies={0: {"value": [undated]}})
+    agent = TeamsAgent(
+        profile_dir="unused",
+        db=tmp_db,
+        session=env.session,
+        min_due_date=datetime(2026, 9, 1, tzinfo=timezone.utc),
+    )
+
+    result = await agent.run()
+
+    assert result.data["total"] == 1
+    assert result.data["dropped_stale"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_filter_when_min_due_date_is_none(tmp_db):
+    old = _assignment("old-1", "46191dc6-0000-0000-0000-000000000000", dueDateTime="2026-04-22T17:59:00Z")
+    env = _Env(tab_bodies={0: {"value": [old]}})
+    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)  # min_due_date defaults to None
+
+    result = await agent.run()
+
+    assert result.data["total"] == 1
+    assert result.data["dropped_stale"] == 0

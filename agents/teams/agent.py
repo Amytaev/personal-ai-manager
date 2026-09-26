@@ -50,7 +50,7 @@ from datetime import datetime, timezone
 
 from agents.base import AgentResult, AgentStatus, BaseAgent
 from agents.teams.auth import TEAMS_URL, TeamsSession
-from agents.teams.parser import parse_work_response
+from agents.teams.parser import parse_due, parse_work_response
 from storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -119,7 +119,13 @@ _RESPONSE_POLL_INTERVAL_MS = 250
 
 
 class TeamsAgent(BaseAgent):
-    def __init__(self, profile_dir: str, db: Database, session: TeamsSession | None = None):
+    def __init__(
+        self,
+        profile_dir: str,
+        db: Database,
+        session: TeamsSession | None = None,
+        min_due_date: datetime | None = None,
+    ):
         super().__init__(name="teams")
         # A pre-built TeamsSession can be injected (tests, or a caller
         # that wants to share one session across agents) - otherwise
@@ -128,6 +134,15 @@ class TeamsAgent(BaseAgent):
         self.session = session or TeamsSession(profile_dir)
         self._owns_session = session is None
         self.db = db
+        # Assignments due before this are dropped before anything is
+        # saved to the DB (config.py's TEAMS_MIN_DUE_DATE) - real data
+        # showed old/stale-semester classes (an unresolved classId whose
+        # "assignments" turned out to be April 2026 announcement spam)
+        # would otherwise pollute /tasks and /briefing forever, since
+        # nothing currently ever marks a task as gone (see parser.py's
+        # docstring). None (the default) means no filtering - used by
+        # tests that don't care about date cutoffs.
+        self.min_due_date = min_due_date
 
     async def aclose(self) -> None:
         if self._owns_session:
@@ -246,6 +261,25 @@ class TeamsAgent(BaseAgent):
         now = datetime.now(timezone.utc)
         tasks = [parse_work_response({"value": [raw]}, now=now)[0] for raw in raw_assignments]
 
+        dropped_stale = 0
+        if self.min_due_date is not None:
+            before_count = len(tasks)
+            # A task with no due date at all is kept - there's no date to
+            # judge its age by, and dropping undated items risks losing
+            # something genuinely current (real captures show
+            # dueDateTime is sometimes null). Only a task with a REAL,
+            # parseable due date earlier than the cutoff is dropped.
+            tasks = [
+                t for t in tasks
+                if (due := parse_due(t["due_at"])) is None or due >= self.min_due_date
+            ]
+            dropped_stale = before_count - len(tasks)
+            if dropped_stale:
+                logger.info(
+                    "Teams agent: dropped %s stale task(s) due before %s",
+                    dropped_stale, self.min_due_date.isoformat(),
+                )
+
         counts = {"new": 0, "changed": 0, "unchanged": 0}
         for task in tasks:
             existing = self.db.get_task_fingerprint(task["id"])
@@ -270,5 +304,5 @@ class TeamsAgent(BaseAgent):
         return AgentResult(
             agent=self.name,
             status=AgentStatus.WORKING,
-            data={"total": len(tasks), **counts},
+            data={"total": len(tasks), "dropped_stale": dropped_stale, **counts},
         )

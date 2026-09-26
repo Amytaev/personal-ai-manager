@@ -63,7 +63,12 @@ def _extract_description(instructions: Any) -> str | None:
     return None
 
 
-def _parse_due(due_iso: str | None) -> datetime | None:
+def parse_due(due_iso: str | None) -> datetime | None:
+    """Parses a raw `dueDateTime` ISO string into an aware datetime, or
+    None for a missing/malformed value. Public (not `_parse_due`) since
+    agents/teams/agent.py also needs it, to filter out assignments from
+    stale/old semesters by their real due date before saving anything
+    to the DB - not just this module's own status computation."""
     if not due_iso:
         return None
     try:
@@ -88,7 +93,7 @@ def compute_status(assignment: dict, submission: dict, *, now: datetime | None =
     if assignment.get("isCompleted"):
         return "completed"
 
-    due = _parse_due(assignment.get("dueDateTime"))
+    due = parse_due(assignment.get("dueDateTime"))
     if due is not None:
         now = now or datetime.now(timezone.utc)
         if due < now:

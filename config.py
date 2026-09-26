@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
@@ -22,6 +23,22 @@ def _int_env(key: str, default: int) -> int:
 def _csv_env(key: str) -> tuple[str, ...]:
     raw = os.getenv(key, "")
     return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def _date_env(key: str, default_iso: str) -> datetime:
+    raw = os.getenv(key) or default_iso
+    # Same "Z" -> "+00:00" normalization agents/teams/parser.py's
+    # parse_due() already uses for the API's own dueDateTime values.
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = datetime.fromisoformat(default_iso.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        # A bare "2026-09-01" (no time/offset) in .env is still a
+        # reasonable thing to write - assume UTC rather than crash,
+        # since it's compared against aware dueDateTime values later.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -51,6 +68,7 @@ class AppConfig:
     lock_file_path: str
     wishlist_path: str
     teams_profile_path: str
+    teams_min_due_date: datetime
 
 
 def load_config() -> AppConfig:
@@ -74,4 +92,11 @@ def load_config() -> AppConfig:
         lock_file_path=os.getenv("LOCK_FILE_PATH", "data/.instance.lock"),
         wishlist_path=os.getenv("WISHLIST_PATH", "config/wishlist.json"),
         teams_profile_path=os.getenv("TEAMS_PROFILE_PATH", "data/teams_browser_profile"),
+        # Assignments due before this are dropped by TeamsAgent before
+        # anything is saved to the DB - stale/old-semester noise
+        # (confirmed for real: the unresolved classId 46191dc6 turned
+        # out to be an old course using "Задания" as an announcements
+        # channel, all dated April 2026). Defaults to the start of the
+        # user's current semester; override in .env if that changes.
+        teams_min_due_date=_date_env("TEAMS_MIN_DUE_DATE", "2026-09-01T00:00:00Z"),
     )

@@ -99,7 +99,11 @@ async def main() -> None:
         # still starts fine and every cycle just reports FAILING (agent.py
         # catches its own auth/API errors), same honest degrade-not-crash
         # pattern as every other agent here.
-        teams_agent = TeamsAgent(profile_dir=config.teams_profile_path, db=db)
+        teams_agent = TeamsAgent(
+            profile_dir=config.teams_profile_path,
+            db=db,
+            min_due_date=config.teams_min_due_date,
+        )
         scheduler.register(
             job_id="teams_check",
             interval_minutes=config.teams_interval_minutes,

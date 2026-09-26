@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -30,6 +31,7 @@ def _config(tmp_path) -> AppConfig:
         lock_file_path=str(tmp_path / ".instance.lock"),
         wishlist_path=str(tmp_path / "wishlist.json"),
         teams_profile_path=str(tmp_path / "teams_browser_profile"),
+        teams_min_due_date=datetime(2026, 9, 1, tzinfo=timezone.utc),
     )
 
 
