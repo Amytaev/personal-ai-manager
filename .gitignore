@@ -19,6 +19,16 @@ data/sso_diagnose_*.png
 !data/.gitkeep
 !logs/.gitkeep
 
+# Local research-capture output (scripts/teams_capture_assignments.py,
+# scripts/valorant_capture_store.py, scripts/sso_capture_data.py) - real
+# captured network responses and DOM snapshots from the user's own
+# authenticated sessions (assignments, store items, schedule/УМКД/course
+# data). Never something to commit - these scripts print an explicit
+# "skim before sending back" reminder for the same reason.
+teams_capture/
+valorant_capture/
+sso_capture/
+
 # Python
 __pycache__/
 *.pyc
