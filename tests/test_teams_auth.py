@@ -14,6 +14,7 @@ def _make_mock_playwright(page_url: str = "https://teams.microsoft.com/v2/"):
     mock_page.url = page_url
     mock_page.goto = AsyncMock()
     mock_page.wait_for_url = AsyncMock()
+    mock_page.wait_for_load_state = AsyncMock()
     mock_page.close = AsyncMock()
 
     mock_context = AsyncMock()
@@ -34,7 +35,13 @@ def _make_mock_playwright(page_url: str = "https://teams.microsoft.com/v2/"):
 
 
 @pytest.mark.asyncio
-async def test_is_logged_in_true_when_url_matches(tmp_path):
+async def test_is_logged_in_true_when_url_matches_after_settling(tmp_path):
+    # Real bug found live (2026-09-26): the old implementation checked
+    # page.wait_for_url() against the very URL it just navigated to,
+    # which resolves instantly and TRUE regardless of what happens next -
+    # it never actually waited for anything. The fix waits for the
+    # network to settle (page.wait_for_load_state("networkidle")) and
+    # then reads page.url directly, so THAT's what these tests exercise now.
     mock_cm, mock_chromium, mock_context, mock_page = _make_mock_playwright()
 
     with patch("agents.teams.auth.async_playwright", return_value=mock_cm):
@@ -42,21 +49,38 @@ async def test_is_logged_in_true_when_url_matches(tmp_path):
         result = await session.is_logged_in()
 
     assert result is True
+    mock_page.wait_for_load_state.assert_awaited_once_with("networkidle", timeout=15_000)
     mock_chromium.launch_persistent_context.assert_awaited_once()
     call_kwargs = mock_chromium.launch_persistent_context.call_args.kwargs
     assert call_kwargs["headless"] is True
 
 
 @pytest.mark.asyncio
-async def test_is_logged_in_false_when_wait_for_url_times_out(tmp_path):
-    mock_cm, mock_chromium, mock_context, mock_page = _make_mock_playwright()
-    mock_page.wait_for_url = AsyncMock(side_effect=TimeoutError("stuck on login page"))
+async def test_is_logged_in_false_when_final_url_is_the_login_domain(tmp_path):
+    mock_cm, mock_chromium, mock_context, mock_page = _make_mock_playwright(
+        page_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize?..."
+    )
 
     with patch("agents.teams.auth.async_playwright", return_value=mock_cm):
         session = TeamsSession(tmp_path / "profile")
         result = await session.is_logged_in()
 
     assert result is False
+
+
+@pytest.mark.asyncio
+async def test_is_logged_in_still_reads_url_when_networkidle_itself_times_out(tmp_path):
+    # A wait_for_load_state() timeout isn't fatal - it's the best signal
+    # we get about whether the page settled, but the final page.url is
+    # read either way rather than treating the timeout itself as failure.
+    mock_cm, mock_chromium, mock_context, mock_page = _make_mock_playwright()
+    mock_page.wait_for_load_state = AsyncMock(side_effect=TimeoutError("never went idle"))
+
+    with patch("agents.teams.auth.async_playwright", return_value=mock_cm):
+        session = TeamsSession(tmp_path / "profile")
+        result = await session.is_logged_in()
+
+    assert result is True  # page.url (the default fixture URL) still matches
 
 
 @pytest.mark.asyncio

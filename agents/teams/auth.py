@@ -90,16 +90,38 @@ class TeamsSession:
         before every data-fetch cycle - a plain automated run, not an
         evasion technique (TZ v4 §3.4): same persistent profile, same
         cookies a normal signed-in browser would have.
+
+        Real bug found live (2026-09-26, five live runs deep): this used
+        to call page.wait_for_url(f"**{LOGGED_IN_URL_HINT}**") right after
+        goto(TEAMS_URL) - but page.url is ALREADY TEAMS_URL the instant
+        goto() resolves (that's the URL we just navigated to ourselves),
+        so that wait_for_url() call matched immediately and returned True
+        with zero real waiting, no matter what Teams' own MSAL client went
+        on to do a moment later. That's exactly why this method - and the
+        near-identical check in scripts/teams_diagnose_reauth.py - kept
+        reporting "still logged in" mere seconds before a real TeamsAgent
+        run hit a genuine, blank Microsoft sign-in form on the SAME
+        profile: this check was never actually waiting for anything.
+        TeamsAgent._fetch_all_assignments()'s own 15s wait for the
+        "Задания" button doesn't have this flaw (it's watching for a
+        DIFFERENT element to appear, not comparing a URL to itself), which
+        is why it - correctly - kept reporting the session as dead while
+        this method kept giving false positives.
+
+        Fixed by waiting for the page's network activity to settle
+        (giving any client-side redirect real wall-clock time to actually
+        happen) before reading page.url, instead of an instant, always-
+        true URL comparison.
         """
         context = await self._ensure_context(headless=True)
         page = await context.new_page()
         try:
             await page.goto(TEAMS_URL, wait_until="domcontentloaded", timeout=30_000)
             try:
-                await page.wait_for_url(f"**{LOGGED_IN_URL_HINT}**", timeout=15_000)
-                return True
-            except Exception:  # noqa: BLE001 - Playwright's own TimeoutError, treated as "not logged in"
-                return False
+                await page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:  # noqa: BLE001 - proceed with whatever state exists either way
+                pass
+            return LOGGED_IN_URL_HINT in page.url
         finally:
             await page.close()
 

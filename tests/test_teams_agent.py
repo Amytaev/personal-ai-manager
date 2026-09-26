@@ -64,7 +64,7 @@ class _Env:
         failing_tab_indexes: tuple[int, ...] = (),
         page_url: str = "https://teams.microsoft.com/v2/some-team",
         button_wait_error: Exception | None = None,
-        wait_for_url_error: Exception | None = None,
+        wait_for_load_state_error: Exception | None = None,
     ):
         self.tab_bodies = tab_bodies or {}
         self.failing_tab_indexes = failing_tab_indexes
@@ -80,14 +80,14 @@ class _Env:
         # failing to prove that never masks the real error.
         self.page.screenshot = AsyncMock()
         self.page.inner_text = AsyncMock(return_value="Sign in to your account")
-        # Mirrors TeamsSession.is_logged_in()'s tolerance for a top-level
-        # MSAL silent-refresh redirect round trip after goto() - defaults to
-        # "resolves immediately" (already on the logged-in URL); tests that
-        # care pass wait_for_url_error to simulate it timing out instead.
-        if wait_for_url_error is not None:
-            self.page.wait_for_url = AsyncMock(side_effect=wait_for_url_error)
+        # Gives any client-side redirect real time to happen after goto() -
+        # defaults to resolving harmlessly; tests that care pass
+        # wait_for_load_state_error to simulate it timing out instead (not
+        # fatal by itself - the button check right after is authoritative).
+        if wait_for_load_state_error is not None:
+            self.page.wait_for_load_state = AsyncMock(side_effect=wait_for_load_state_error)
         else:
-            self.page.wait_for_url = AsyncMock()
+            self.page.wait_for_load_state = AsyncMock()
 
         button_locator = MagicMock()
         if button_wait_error is not None:
@@ -274,31 +274,30 @@ async def test_run_reports_plain_failure_when_button_timeout_but_url_still_looks
 
 
 @pytest.mark.asyncio
-async def test_run_waits_for_redirect_round_trip_to_settle_before_checking_the_button(tmp_db):
-    # Real fix (2026-09-26): a still-valid session can bounce through a
-    # top-level MSAL refresh redirect after goto() - this must be given a
-    # chance to land back on LOGGED_IN_URL_HINT before the button/url check
-    # runs, exactly like TeamsSession.is_logged_in() already does.
+async def test_run_waits_for_network_to_settle_before_checking_the_button(tmp_db):
+    # Real fix (2026-09-26, after discovering the wait_for_url()-based
+    # version of this was a no-op - see agents/teams/agent.py's comment):
+    # a still-valid session can bounce through a top-level MSAL refresh
+    # redirect after goto() - this gives it real wall-clock time to land
+    # back on LOGGED_IN_URL_HINT before the button/url check runs.
     env = _Env(tab_bodies={0: {"value": [_assignment("a1", "e3f75118-bae6-4636-87c7-b2e91b63f913")]}})
     agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
 
     result = await agent.run()
 
-    env.page.wait_for_url.assert_awaited_once()
-    (pattern,), _ = env.page.wait_for_url.call_args
-    assert "teams.microsoft.com/v2/" in pattern
+    env.page.wait_for_load_state.assert_awaited_once_with("networkidle", timeout=15_000)
     assert result.status == AgentStatus.WORKING
 
 
 @pytest.mark.asyncio
-async def test_run_still_succeeds_when_the_wait_for_url_call_itself_times_out_but_url_recovers(tmp_db):
-    # wait_for_url() timing out isn't fatal by itself - it's only a hint;
-    # the button-visibility check right after is what actually decides
-    # success/failure, so if the button is there anyway (e.g. the redirect
-    # resolved a beat after the 20s window), the run should still work.
+async def test_run_still_succeeds_when_the_wait_for_load_state_call_itself_times_out(tmp_db):
+    # wait_for_load_state() timing out isn't fatal by itself - it's only a
+    # hint; the button-visibility check right after is what actually
+    # decides success/failure, so if the button is there anyway, the run
+    # should still work.
     env = _Env(
         tab_bodies={0: {"value": [_assignment("a1", "e3f75118-bae6-4636-87c7-b2e91b63f913")]}},
-        wait_for_url_error=TimeoutError("Timeout 20000ms exceeded"),
+        wait_for_load_state_error=TimeoutError("never went idle"),
     )
     agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
 

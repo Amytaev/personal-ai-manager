@@ -229,47 +229,33 @@ class TeamsAgent(BaseAgent):
             if isinstance(body, dict) and isinstance(body.get("value"), list):
                 captured_bodies.append(body)
 
-        # NOTE: this listener used to be registered here, before goto() -
-        # moved below (right before the button click) as of 2026-09-26.
-        # Real live testing that day showed a diagnostic script doing the
-        # exact same goto()+wait_for_url() as below, on the exact same
-        # profile, seconds apart, succeeding every time - the ONLY
-        # remaining difference from this method was this listener (which
-        # spawns an asyncio task, via response.json(), for literally every
-        # single resource the login/SPA page loads while it's deciding
-        # whether to silently refresh Teams' access token). That's a real,
-        # concrete difference between "worked" and "didn't" runs, even if
-        # the exact mechanism (event-loop contention delaying whatever
-        # timing-sensitive check MSAL's own JS does during that silent
-        # refresh) isn't independently confirmed - nothing captured by
-        # this listener is needed before the "Задания" button exists
-        # anyway (the work API never fires before that click), so there's
-        # no downside to only turning it on once we're past the point
-        # where auth is being decided.
+        # This listener is registered right before the button click
+        # further down, not here before goto() - nothing it captures can
+        # possibly fire before the "Задания" button exists anyway (the
+        # work API never fires before that click), and an earlier live
+        # test (2026-09-26) suspected registering it this early might be
+        # interfering with Teams' own auth handshake. That specific
+        # suspicion didn't hold up (moving it changed nothing in the next
+        # live test), but there's still no reason to move it back - it
+        # costs nothing to wait.
         try:
             await page.goto(TEAMS_URL, wait_until="domcontentloaded", timeout=30_000)
 
-            # Real failure seen live (2026-09-26, twice, immediately after a
-            # confirmed-successful scripts/teams_login_setup.py run whose own
-            # headless is_logged_in() re-check passed): a fresh, still-valid
-            # session can still bounce through a full top-level redirect to
-            # login.microsoftonline.com/.../authorize (Teams' MSAL client
-            # silently refreshing its access token) before landing back on
-            # teams.microsoft.com/v2/. TeamsSession.is_logged_in() already
-            # tolerates this round trip with its own page.wait_for_url() call
-            # - this method didn't: it used to go straight from goto() (which
-            # can resolve mid-redirect, while page.url is still the
-            # login.microsoftonline.com address) into the button check below,
-            # so it was reading page.url before the redirect had a chance to
-            # finish and mis-diagnosing an in-flight refresh as a dead
-            # session. Give it the same chance to settle here, using the
-            # exact tested pattern from is_logged_in() - if the session
-            # really is dead this will simply time out and page.url will
-            # still show the login domain, which the check below already
-            # handles correctly.
+            # Real bug found live (2026-09-26, five runs deep): a prior
+            # version of this code waited here for
+            # page.wait_for_url(f"**{LOGGED_IN_URL_HINT}**") to tolerate a
+            # same-URL redirect round trip - but page.url is ALREADY
+            # TEAMS_URL the instant goto() resolves (we just navigated
+            # there ourselves), so that check matched immediately and
+            # never actually waited for anything, regardless of what
+            # Teams' own MSAL client went on to do afterwards. See
+            # TeamsSession.is_logged_in()'s docstring for the full story -
+            # same bug, same fix: wait for the network to actually settle
+            # (giving any client-side redirect real time to happen) before
+            # the button-visibility check below makes the real decision.
             try:
-                await page.wait_for_url(f"**{LOGGED_IN_URL_HINT}**", timeout=20_000)
-            except Exception:  # noqa: BLE001 - Playwright's own TimeoutError; handled below
+                await page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:  # noqa: BLE001 - proceed either way; the button check below is authoritative
                 pass
 
             assignments_button = page.get_by_role("button", name=_ASSIGNMENTS_BUTTON_NAME).first
@@ -282,10 +268,10 @@ class TeamsAgent(BaseAgent):
                 # which one actually happened, instead of guessing:
                 # either Teams itself navigated away from
                 # LOGGED_IN_URL_HINT and STAYED away even after the
-                # wait_for_url() above gave it 20s to bounce back (a
-                # genuinely stale session), or the URL matches and the
-                # button itself just isn't there (a real UI change,
-                # unrelated to auth).
+                # networkidle wait above gave any redirect real time to
+                # finish (a genuinely stale session), or the URL matches
+                # and the button itself just isn't there (a real UI
+                # change, unrelated to auth).
                 await _capture_failure_diagnostics(page)
                 if LOGGED_IN_URL_HINT not in page.url:
                     raise NeedsReauth(
