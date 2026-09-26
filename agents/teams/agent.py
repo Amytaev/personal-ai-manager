@@ -49,11 +49,24 @@ import logging
 from datetime import datetime, timezone
 
 from agents.base import AgentResult, AgentStatus, BaseAgent
-from agents.teams.auth import TEAMS_URL, TeamsSession
+from agents.teams.auth import LOGGED_IN_URL_HINT, TEAMS_URL, TeamsSession
 from agents.teams.parser import parse_due, parse_work_response
 from storage.database import Database
 
 logger = logging.getLogger(__name__)
+
+
+class NeedsReauth(RuntimeError):
+    """Raised when the "Задания" button never became visible AND the
+    page's URL no longer matches LOGGED_IN_URL_HINT - i.e. Teams itself
+    navigated away from the app (real behavior confirmed live, see
+    _fetch_all_assignments' comment at the wait_for() call below), the
+    same signal TeamsSession.is_logged_in() already uses. A human needs
+    to log back in by hand (scripts/teams_login_setup.py). Deliberately
+    a distinct exception from a generic RuntimeError so run() can tell a
+    stale session apart from an actual UI/markup change - mirrors
+    agents/valorant/agent.py's NeedsReauth, added for the same reason
+    when that agent hit the identical class of problem in Phase 6."""
 
 # Substring match on every response's URL - matches both the global
 # .../edu/me/work dashboard endpoint and any per-class
@@ -193,7 +206,33 @@ class TeamsAgent(BaseAgent):
             await page.goto(TEAMS_URL, wait_until="networkidle", timeout=30_000)
 
             assignments_button = page.get_by_role("button", name=_ASSIGNMENTS_BUTTON_NAME).first
-            await assignments_button.wait_for(state="visible", timeout=15_000)
+            try:
+                await assignments_button.wait_for(state="visible", timeout=15_000)
+            except Exception as exc:  # noqa: BLE001 - Playwright's own TimeoutError
+                # Real failure seen live (2026-09-26 smoke test): this
+                # wait_for() is exactly where the agent timed out. Two
+                # different real causes produce the identical
+                # TimeoutError here, so page.url - the same signal
+                # TeamsSession.is_logged_in() already uses - decides
+                # which one actually happened, instead of guessing:
+                # either Teams itself navigated away from
+                # LOGGED_IN_URL_HINT (a stale/expired session - the
+                # button was never going to appear because we're not
+                # looking at a logged-in Teams page at all), or the URL
+                # still looks right and the button itself just isn't
+                # there (a real UI change, unrelated to auth).
+                if LOGGED_IN_URL_HINT not in page.url:
+                    raise NeedsReauth(
+                        f"Teams session looks expired - after opening {TEAMS_URL} the page "
+                        f"ended up at {page.url!r} (expected a URL containing "
+                        f"{LOGGED_IN_URL_HINT!r}) and the \"{_ASSIGNMENTS_BUTTON_NAME}\" button "
+                        "never appeared. Run scripts/teams_login_setup.py to log back in."
+                    ) from exc
+                raise RuntimeError(
+                    f"Session looks logged in (URL {page.url!r} matched "
+                    f"{LOGGED_IN_URL_HINT!r}) but the \"{_ASSIGNMENTS_BUTTON_NAME}\" button "
+                    "never became visible within 15000ms - Teams' UI may have changed."
+                ) from exc
             await assignments_button.click(timeout=5_000)
 
             # The default ("Предстоящие"/Upcoming) tab fires its own
@@ -255,7 +294,14 @@ class TeamsAgent(BaseAgent):
     async def run(self) -> AgentResult:
         try:
             raw_assignments = await self._fetch_all_assignments()
-        except Exception as exc:  # noqa: BLE001 - expected failure mode (auth expired, UI changed)
+        except NeedsReauth as exc:
+            return AgentResult(
+                agent=self.name,
+                status=AgentStatus.FAILING,
+                error=str(exc),
+                data={"needs_reauth": True},
+            )
+        except Exception as exc:  # noqa: BLE001 - expected failure mode (UI changed, network, etc.)
             return AgentResult(agent=self.name, status=AgentStatus.FAILING, error=f"{type(exc).__name__}: {exc}")
 
         now = datetime.now(timezone.utc)
@@ -304,5 +350,5 @@ class TeamsAgent(BaseAgent):
         return AgentResult(
             agent=self.name,
             status=AgentStatus.WORKING,
-            data={"total": len(tasks), "dropped_stale": dropped_stale, **counts},
+            data={"total": len(tasks), "dropped_stale": dropped_stale, "needs_reauth": False, **counts},
         )

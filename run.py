@@ -34,13 +34,40 @@ async def _daily_retention_cleanup(db: Database, retention_days: int) -> None:
     logger.info("Retention cleanup: %s", deleted)
 
 
-async def _teams_cycle(agent: TeamsAgent, db: Database) -> None:
+async def _notify_needs_reauth(bot: TelegramBot | None, dedupe_key: str, text: str) -> None:
+    # Shared by _teams_cycle and _valorant_cycle below - a stale browser
+    # session needs a DISTINCT Telegram notification ("go log back in on
+    # your PC"), not just a silent red marker in /status, since the
+    # person may be away from their PC with no way to fix it themselves
+    # until they notice. `bot` may still be None here (this can run once
+    # before the bot is constructed, at startup - see main() below) -
+    # skip the notification rather than crash the cycle either way,
+    # run_and_record() already recorded the failure in agent_runs
+    # regardless. Deduplicated via bot.notify()'s usual (kind,
+    # dedupe_key) mechanism, so a still-broken session doesn't re-notify
+    # every single cycle.
+    if bot is not None:
+        await bot.notify(kind="agent_status_change", dedupe_key=dedupe_key, text=text)
+
+
+async def _teams_cycle(agent: TeamsAgent, db: Database, bot: TelegramBot | None) -> None:
     # Unlike _weather_cycle, TeamsAgent.run() already writes its own rows
     # (storage/database.py's upsert_task) as part of run() itself, since
     # per-task new/changed/unchanged state has to be computed against
     # what's already stored - there's nothing left for run.py to persist
     # afterwards, just the agent_runs bookkeeping run_and_record() does.
-    await run_and_record(agent, db)
+    result = await run_and_record(agent, db)
+
+    if result.data.get("needs_reauth"):
+        await _notify_needs_reauth(
+            bot,
+            dedupe_key="teams:needs_reauth",
+            text=(
+                "\U0001f4da Teams Agent: сессия Microsoft истекла.\n"
+                "Открой приложение на ПК и войди в Teams заново:\n"
+                "python -m scripts.teams_login_setup"
+            ),
+        )
 
 
 async def _weather_cycle(agent: WeatherAgent, db: Database) -> None:
@@ -61,19 +88,9 @@ async def _valorant_cycle(agent: ValorantAgent, db: Database, bot: TelegramBot |
     # persist here.
     result = await run_and_record(agent, db)
 
-    # bro's Phase 6.3 review: a stale Stack B session needs a DISTINCT
-    # Telegram notification ("go log back in on your PC"), not just a
-    # silent red marker in /status - since, unlike Teams (whose session
-    # only matters for a scheduled check nobody's waiting on), a stale
-    # VALORANT session means the person may be stuck away from their PC
-    # with no way to fix it themselves until they notice. `bot` may
-    # still be None here (this can run once before the bot is
-    # constructed, at startup - see main() below) - skip the
-    # notification rather than crash the cycle either way, run_and_record
-    # already recorded the failure in agent_runs regardless.
-    if bot is not None and result.data.get("needs_reauth"):
-        await bot.notify(
-            kind="agent_status_change",
+    if result.data.get("needs_reauth"):
+        await _notify_needs_reauth(
+            bot,
             dedupe_key="valorant:needs_reauth",
             text=(
                 "\U0001f3ae VALORANT Agent: сессия Stack B истекла.\n"
@@ -138,7 +155,7 @@ async def main() -> None:
         scheduler.register(
             job_id="teams_check",
             interval_minutes=config.teams_interval_minutes,
-            func=lambda: _teams_cycle(teams_agent, db),
+            func=lambda: _teams_cycle(teams_agent, db, bot),
         )
 
         # No on/off config flag for VALORANT either, same reasoning as
@@ -170,14 +187,6 @@ async def main() -> None:
             # run_and_record/run_isolated, so this can't crash startup.
             await _weather_cycle(weather_agent, db)
 
-        if teams_agent is not None:
-            # Same immediate-first-run rationale as weather above - and
-            # since this may open a real (headless) browser against a
-            # profile that was never logged in (e.g. first-ever run),
-            # _teams_cycle/run_and_record already turn that into a
-            # FAILING AgentResult rather than letting it crash startup.
-            await _teams_cycle(teams_agent, db)
-
         if config.telegram_bot_token and config.telegram_chat_id:
             bot = TelegramBot(config=config, db=db, wishlist=wishlist)
             await bot.start()
@@ -186,12 +195,24 @@ async def main() -> None:
                 "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set - running without the Telegram bot"
             )
 
+        if teams_agent is not None:
+            # Same immediate-first-run rationale as weather above - and
+            # since this may open a real (headless) browser against a
+            # profile that was never logged in (e.g. first-ever run),
+            # _teams_cycle/run_and_record already turn that into a
+            # FAILING AgentResult rather than letting it crash startup.
+            # Placed AFTER the bot is constructed (unlike weather) so a
+            # needs_reauth found on this very first run can still trigger
+            # the Telegram notification right away, instead of silently
+            # waiting for the next scheduled cycle.
+            await _teams_cycle(teams_agent, db, bot)
+
         if valorant_agent is not None:
             # Same immediate-first-run rationale as weather/teams above -
-            # placed AFTER the bot is constructed (unlike those two) so
-            # that a needs_reauth found on this very first run can still
-            # trigger the Telegram notification right away, instead of
-            # silently waiting for the next scheduled cycle.
+            # placed AFTER the bot is constructed so that a needs_reauth
+            # found on this very first run can still trigger the
+            # Telegram notification right away, instead of silently
+            # waiting for the next scheduled cycle.
             await _valorant_cycle(valorant_agent, db, bot)
 
         stop_event = asyncio.Event()

@@ -19,5 +19,12 @@ __pycache__/
 venv/
 *.egg-info/
 
-# Playwright persistent browser profile (Phase 5) - contains session cookies
+# Playwright persistent browser profiles (Phase 5 Teams, Phase 6
+# VALORANT/Stack B) - contain real session cookies (Microsoft, Riot via
+# Stack B). The old bare "browser_profile/" pattern below never actually
+# matched either real directory name (teams_browser_profile/,
+# valorant_browser_profile/) - kept for safety, but the glob below is
+# the one that actually covers them, and any future *_browser_profile/
+# directory added under data/.
 browser_profile/
+data/*browser_profile*/

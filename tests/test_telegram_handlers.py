@@ -13,6 +13,8 @@ from telegram_bot.handlers import Handlers
 def _fake_update_and_context(args: list[str] | None = None, text: str | None = None):
     update = MagicMock()
     update.message.reply_text = AsyncMock()
+    update.message.reply_photo = AsyncMock()
+    update.message.reply_media_group = AsyncMock()
     update.message.text = text
     context = MagicMock()
     context.args = args or []
@@ -94,7 +96,11 @@ async def test_store_honest_when_empty(handlers):
 
 
 @pytest.mark.asyncio
-async def test_store_formats_real_items_from_db(handlers, tmp_db):
+async def test_store_sends_media_group_with_captions_and_reset_time(handlers, tmp_db):
+    # Real shape (Phase 6.3): 2+ items with image_url -> one media group
+    # message (Telegram requires >=2 items for sendMediaGroup), each
+    # photo captioned with name + price, followed by a text message with
+    # the reset countdown.
     tmp_db.save_valorant_store(
         [
             {"uuid": "88f1bcbd-4dfd-f2ef-8a2c-44b3baa26b3c", "name": "Апертура", "price_vp": 1275, "image_url": "https://example.com/a.png"},
@@ -106,10 +112,91 @@ async def test_store_formats_real_items_from_db(handlers, tmp_db):
     update, context = _fake_update_and_context()
     await handlers.store(update, context)
 
+    update.message.reply_media_group.assert_awaited_once()
+    media = update.message.reply_media_group.call_args.kwargs["media"]
+    assert len(media) == 2
+    assert media[0].caption == "Апертура — 1275 VP"
+    assert media[0].media == "https://example.com/a.png"
+    assert media[1].caption == "Куронами — 2375 VP"
+
+    update.message.reply_photo.assert_not_awaited()
+    tail_text = update.message.reply_text.call_args.args[0]
+    assert "7 часов и 49 минут" in tail_text
+
+
+@pytest.mark.asyncio
+async def test_store_sends_single_photo_when_only_one_item_has_an_image(handlers, tmp_db):
+    tmp_db.save_valorant_store(
+        [{"uuid": "u1", "name": "Пустошь", "price_vp": 1275, "image_url": "https://example.com/x.png"}],
+        reset_in="1 час",
+    )
+
+    update, context = _fake_update_and_context()
+    await handlers.store(update, context)
+
+    update.message.reply_photo.assert_awaited_once()
+    kwargs = update.message.reply_photo.call_args.kwargs
+    assert kwargs["photo"] == "https://example.com/x.png"
+    assert kwargs["caption"] == "Пустошь — 1275 VP"
+    update.message.reply_media_group.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_store_lists_items_missing_an_image_as_text(handlers, tmp_db):
+    tmp_db.save_valorant_store(
+        [
+            {"uuid": "u1", "name": "Апертура", "price_vp": 1275, "image_url": "https://example.com/a.png"},
+            {"uuid": "u2", "name": "Куронами", "price_vp": 2375, "image_url": "https://example.com/b.png"},
+            {"uuid": "u3", "name": "БезКартинки", "price_vp": 500, "image_url": None},
+        ],
+        reset_in=None,
+    )
+
+    update, context = _fake_update_and_context()
+    await handlers.store(update, context)
+
+    update.message.reply_media_group.assert_awaited_once()
+    tail_text = update.message.reply_text.call_args.args[0]
+    assert "БезКартинки" in tail_text and "500 VP" in tail_text
+
+
+@pytest.mark.asyncio
+async def test_store_falls_back_to_text_when_sending_photos_fails(handlers, tmp_db):
+    from telegram.error import TelegramError
+
+    tmp_db.save_valorant_store(
+        [
+            {"uuid": "u1", "name": "Апертура", "price_vp": 1275, "image_url": "https://example.com/a.png"},
+            {"uuid": "u2", "name": "Куронами", "price_vp": 2375, "image_url": "https://example.com/b.png"},
+        ],
+        reset_in="1 час",
+    )
+    update, context = _fake_update_and_context()
+    update.message.reply_media_group = AsyncMock(side_effect=TelegramError("bad photo url"))
+
+    await handlers.store(update, context)
+
     text = update.message.reply_text.call_args.args[0]
     assert "Апертура" in text and "1275 VP" in text
     assert "Куронами" in text and "2375 VP" in text
-    assert "7 часов и 49 минут" in text
+
+
+@pytest.mark.asyncio
+async def test_store_warns_when_last_agent_run_failed_but_shows_stale_data(handlers, tmp_db):
+    tmp_db.save_valorant_store(
+        [{"uuid": "u1", "name": "Апертура", "price_vp": 1275, "image_url": "https://example.com/a.png"}],
+        reset_in="1 час",
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    tmp_db.record_agent_run("valorant", "failing", now, now, "VALORANT_STORE_PARSE_ERROR: ...")
+
+    update, context = _fake_update_and_context()
+    await handlers.store(update, context)
+
+    # First call is the warning, then the photo, then the reset-time tail.
+    warning_text = update.message.reply_text.call_args_list[0].args[0]
+    assert "устаревш" in warning_text.lower() or "ошибк" in warning_text.lower()
+    update.message.reply_photo.assert_awaited_once()
 
 
 @pytest.mark.asyncio

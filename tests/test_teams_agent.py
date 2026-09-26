@@ -62,18 +62,24 @@ class _Env:
         tab_bodies: dict[int, dict] | None = None,
         has_assignments_frame: bool = True,
         failing_tab_indexes: tuple[int, ...] = (),
+        page_url: str = "https://teams.microsoft.com/v2/some-team",
+        button_wait_error: Exception | None = None,
     ):
         self.tab_bodies = tab_bodies or {}
         self.failing_tab_indexes = failing_tab_indexes
         self._response_handler = None
 
         self.page = MagicMock()
+        self.page.url = page_url
         self.page.goto = AsyncMock()
         self.page.close = AsyncMock()
         self.page.on = MagicMock(side_effect=self._capture_handler)
 
         button_locator = MagicMock()
-        button_locator.wait_for = AsyncMock()
+        if button_wait_error is not None:
+            button_locator.wait_for = AsyncMock(side_effect=button_wait_error)
+        else:
+            button_locator.wait_for = AsyncMock()
         button_locator.click = AsyncMock(side_effect=self._make_click_side_effect(0))
         role_locator = MagicMock()
         role_locator.first = button_locator
@@ -193,6 +199,51 @@ async def test_run_marks_new_then_unchanged_then_changed_across_runs(tmp_db):
         row = conn.execute("SELECT state, due_at FROM tasks WHERE id = 'a1'").fetchone()
     assert row["state"] == "changed"
     assert row["due_at"] == "2026-11-01T14:30:00Z"
+
+
+@pytest.mark.asyncio
+async def test_run_reports_needs_reauth_when_button_timeout_and_url_shows_logged_out(tmp_db):
+    # Real failure mode seen live (2026-09-26): the "Задания" button
+    # never appears because the session expired and Teams navigated
+    # away to something that no longer matches LOGGED_IN_URL_HINT.
+    env = _Env(
+        page_url="https://login.microsoftonline.com/some-tenant/saml2",
+        button_wait_error=TimeoutError("Timeout 15000ms exceeded"),
+    )
+    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
+
+    result = await agent.run()
+
+    assert result.status == AgentStatus.FAILING
+    assert result.data["needs_reauth"] is True
+    assert "NeedsReauth" in result.error or "expired" in result.error.lower()
+
+
+@pytest.mark.asyncio
+async def test_run_reports_plain_failure_when_button_timeout_but_url_still_looks_logged_in(tmp_db):
+    # Same TimeoutError, but the URL still matches LOGGED_IN_URL_HINT -
+    # not a stale session, something about Teams' own UI changed.
+    env = _Env(
+        page_url="https://teams.microsoft.com/v2/some-team",
+        button_wait_error=TimeoutError("Timeout 15000ms exceeded"),
+    )
+    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
+
+    result = await agent.run()
+
+    assert result.status == AgentStatus.FAILING
+    assert result.data.get("needs_reauth") is not True
+    assert "UI may have changed" in result.error
+
+
+@pytest.mark.asyncio
+async def test_run_reports_needs_reauth_false_on_success(tmp_db):
+    env = _Env(tab_bodies={0: {"value": [_assignment("a1", "e3f75118-bae6-4636-87c7-b2e91b63f913")]}})
+    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
+
+    result = await agent.run()
+
+    assert result.data["needs_reauth"] is False
 
 
 @pytest.mark.asyncio
