@@ -97,7 +97,23 @@ async def main() -> None:
             await asyncio.get_event_loop().run_in_executor(None, input, "")
             attempt += 1
             current_url = page.url
-            print(f"\n[attempt {attempt}] Current page URL:\n  {current_url}")
+            print(f"\n[attempt {attempt}] Top-level page URL:\n  {current_url}")
+
+            # Teams renders "personal apps" like Assignments inside an
+            # iframe on a DIFFERENT origin - page.url only ever shows the
+            # top-level teams.cloud.microsoft URL, never the iframe's own
+            # URL, which is very likely where the real navigation (and
+            # the SSO cookie exchange for assignments.edu.cloud.microsoft)
+            # actually happens. List every frame on every open tab so the
+            # real origin shows up here instead of staying invisible.
+            all_pages = context.pages
+            print(f"[attempt {attempt}] Open tab(s): {len(all_pages)}")
+            for page_index, p in enumerate(all_pages):
+                print(f"  tab {page_index}: {p.url}")
+                for frame in p.frames:
+                    if frame.url and frame.url != p.url:
+                        print(f"    frame: {frame.url}")
+
             print(f"[attempt {attempt}] Calling the work API from this context...")
             ok, bad_status, items = await _try_work_api(context)
             if ok:
