@@ -666,6 +666,37 @@ API-вызовами — не потому что это технически о
 истёкшей сессии, а безопасный дефолт — любой не-200 или тело не `true`
 трактуется как "не залогинен".
 
+### Живой баг: TLS-сертификат ловится по-разному для страницы и для `context.request`
+
+Первый же реальный прогон `python run.py` (2026-09-27) уронил
+`SsoAgent` не на авторизации, а раньше — на самом первом
+`context.request.get()`:
+
+```
+Error: APIRequestContext.get: unable to verify the first certificate;
+if the root CA is installed locally, try running Node.js with --use-system-ca
+```
+
+Настоящая причина, а не догадка: `page.goto()` на
+`stud.satbayev.university` прошёл в том же профиле секундами раньше без
+единой жалобы, а `context.request.get()` на `api.satbayev.university`
+упал сразу. `context.request` — это отдельный (Node-based) сетевой
+стек Playwright, а не движок рендеринга Chromium: у него нет AIA
+chasing (автодогрузки отсутствующего промежуточного сертификата), которую
+браузерный движок делает прозрачно при обычной навигации. Судя по всему,
+цепочка сертификатов `api.satbayev.university` реально неполная на
+сервере — Chromium её достраивает сам, а Node-стек `context.request`
+этого не делает и просто отваливается. Раз `agents/sso/agent.py`
+намеренно тянет всё через `context.request` (см. выше, почему), это
+валило бы каждый прогон независимо от валидности сессии.
+
+**Фикс** — `ignore_https_errors=True` при создании persistent-контекста
+в `agents/sso/auth.py`, только для SSO-профиля (Teams/VALORANT не
+затронуты). Это осознанное послабление TLS-проверки, а не дырка на
+произвольный сайт: домен — свой собственный, известный университетский
+API, доступ — read-only, риск MITM на этом конкретном
+локально-запущенном профиле принят как разумный.
+
 ### Что агент осознанно НЕ делает
 
 - **Не скачивает файлы УМКД.** `GET api.satbayev.university/api/Umkd/Download?fileId=<id>`

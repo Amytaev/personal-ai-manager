@@ -62,6 +62,11 @@ async def test_is_logged_in_true_when_endpoint_returns_true(tmp_path):
     assert call_args.args[0] == IS_AUTHENTICATED_URL
     call_kwargs = mock_chromium.launch_persistent_context.call_args.kwargs
     assert call_kwargs["headless"] is True
+    # Real bug found live (2026-09-27): context.request.get() against
+    # api.satbayev.university failed TLS verification (missing
+    # intermediate cert, no AIA chasing in Playwright's Node-based
+    # request stack) - see agents/sso/auth.py's docstring at this call.
+    assert call_kwargs["ignore_https_errors"] is True
 
 
 @pytest.mark.asyncio

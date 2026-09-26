@@ -90,6 +90,27 @@ class SsoSession:
             user_data_dir=str(self.profile_dir),
             headless=headless,
             viewport={"width": 1280, "height": 800},
+            # REAL bug found live (2026-09-27, first run.py run of
+            # SsoAgent): context.request.get() against
+            # api.satbayev.university failed with "unable to verify the
+            # first certificate" - while page.goto() to
+            # stud.satbayev.university, moments earlier, in the SAME
+            # profile, raised nothing. Not a guess: Playwright's
+            # context.request goes through its own (Node-based) network
+            # stack, which - unlike a real Chromium page navigation -
+            # does not automatically fetch a missing intermediate
+            # certificate via AIA chasing. Chromium's page-rendering
+            # engine does that fetch-and-cache transparently, which is
+            # exactly why the identical (likely incomplete server-side)
+            # chain never surfaced as a problem for page.goto(). Since
+            # agents/sso/agent.py deliberately fetches everything through
+            # context.request (see its docstring for why), this would
+            # otherwise NeedsReauth-fail on every single run regardless
+            # of session validity. Scoped to only this SSO profile - the
+            # domain here is the user's own, known university API, not
+            # an unknown/attacker-controlled one, and this stays
+            # read-only automation either way.
+            ignore_https_errors=True,
         )
         self._context_headless = headless
         return self._context
