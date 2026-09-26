@@ -29,6 +29,7 @@ def _config(tmp_path) -> AppConfig:
         log_dir=str(tmp_path / "logs"),
         lock_file_path=str(tmp_path / ".instance.lock"),
         wishlist_path=str(tmp_path / "wishlist.json"),
+        teams_profile_path=str(tmp_path / "teams_browser_profile"),
     )
 
 

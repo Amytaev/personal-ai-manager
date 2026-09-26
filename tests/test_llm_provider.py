@@ -26,6 +26,7 @@ def _config(**overrides) -> AppConfig:
         log_dir="logs",
         lock_file_path="data/.instance.lock",
         wishlist_path="config/wishlist.json",
+        teams_profile_path="data/teams_browser_profile",
     )
     base.update(overrides)
     return AppConfig(**base)

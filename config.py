@@ -50,6 +50,7 @@ class AppConfig:
     log_dir: str
     lock_file_path: str
     wishlist_path: str
+    teams_profile_path: str
 
 
 def load_config() -> AppConfig:
@@ -72,4 +73,5 @@ def load_config() -> AppConfig:
         log_dir=os.getenv("LOG_DIR", "logs"),
         lock_file_path=os.getenv("LOCK_FILE_PATH", "data/.instance.lock"),
         wishlist_path=os.getenv("WISHLIST_PATH", "config/wishlist.json"),
+        teams_profile_path=os.getenv("TEAMS_PROFILE_PATH", "data/teams_browser_profile"),
     )

@@ -9,11 +9,17 @@ python-telegram-bot>=21,<22
 # --- Phase 4 (Weather Agent) - actually used now ---
 httpx
 
+# --- Phase 5 (Teams Agent) - actually used now ---
+# NOTE: pip install alone is NOT enough - Playwright also needs its
+# browser binaries, which pip does not download. Run this once, after
+# pip install -r requirements.txt:
+#   playwright install chromium
+playwright
+
 # --- Testing ---
 pytest
 pytest-asyncio
 pytest-mock
 
 # --- Future phases (listed here for reference, not yet imported by any code) ---
-# playwright            # Phase 5: Teams browser automation fallback
 # keyring               # Phase 3/5: DPAPI-backed secret storage on Windows (see note below)
