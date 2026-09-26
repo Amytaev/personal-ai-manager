@@ -3,13 +3,13 @@
 Локальная система персональной автоматизации (Teams / Weather / VALORANT →
 AI Manager → Telegram). Полное ТЗ см. `TZ_v4.md` (хранится отдельно).
 
-**Текущее состояние: Phase 6.3 — Teams / Telegram / VALORANT доведены до
-рабочего состояния.** Teams Agent (Phase 5) и VALORANT Agent (Phase 6)
-оба реализованы и подключены в `run.py`, `/store` в Telegram показывает
-реальные скины с картинками, а протухшая сессия (Teams или Stack B)
-шлёт отдельное Telegram-уведомление вместо тихого падения. Следующий
-шаг — Phase 7, AI Manager (агрегация/приоритизация/LLM-сводка поверх
-всех трёх источников).
+**Текущее состояние: Этап B — SSO Agent (Schedule + UMKD) добавлен поверх
+Phase 6.3.** Teams Agent (Phase 5), VALORANT Agent (Phase 6) и теперь SSO
+Agent (bro's ТЗ, Этап A/B) все реализованы и подключены в `run.py`,
+`/store` в Telegram показывает реальные скины с картинками, а протухшая
+сессия (Teams, Stack B или SSO) шлёт отдельное Telegram-уведомление
+вместо тихого падения. Study Manager, Checker Agent, Auth Checker Agent
+и Telegram Mini App из bro's ТЗ остаются нетронутыми — следующий шаг.
 
 ## Что уже есть
 
@@ -22,7 +22,8 @@ AI Manager → Telegram). Полное ТЗ см. `TZ_v4.md` (хранится �
 | **Riot RSO (OAuth) — исследовано, недоступно для этого проекта** | — | ✅ VERIFIED: только approved production apps, и даже так не отдаёт Personal Store |
 | **Persistent Stack B browser session** | `agents/valorant/auth.py` | ✅ Phase 6, протестировано на моках Playwright |
 | Парсер магазина Stack B → skin rows + VALORANT Agent (полный цикл run()) | `agents/valorant/parser.py`, `agents/valorant/agent.py` | ✅ Phase 6, реальные данные подтверждены |
-| Диагностические скрипты (вход/захват трафика) | `scripts/teams_login_setup.py`, `scripts/teams_capture_assignments.py`, `scripts/valorant_login_setup.py`, `scripts/valorant_capture_store.py` | ✅ готовы к запуску пользователем |
+| Диагностические скрипты (вход/захват трафика) | `scripts/teams_login_setup.py`, `scripts/teams_capture_assignments.py`, `scripts/valorant_login_setup.py`, `scripts/valorant_capture_store.py`, `scripts/sso_login_setup.py`, `scripts/sso_check_portal_access.py`, `scripts/sso_capture_data.py` | ✅ готовы к запуску пользователем |
+| **SSO/УМКД — чистый JSON API, никакого HTML-парсинга** | `agents/sso/auth.py`, `agents/sso/parser.py`, `agents/sso/agent.py` | ✅ Этап B, реальные данные подтверждены (см. раздел ниже) |
 
 ## Phase 1 → Phase 5: закрытый вопрос про Graph API
 
@@ -622,9 +623,83 @@ tool-calling роутер. На "Что там на сегодня?" Claude от
 интерфейсов, без риска переписывать его под источник, которого ещё не
 было.
 
+## Этап B: SSO Agent — Schedule + UMKD
+
+### Почему здесь нет HTML-парсинга вообще — в отличие от Teams и VALORANT
+
+И Teams (Bearer-токен живёт только в JS-памяти iframe после реального
+UI-хендшейка, см. выше), и VALORANT/Stack B (нет JSON API вообще, только
+серверный HTML-фрагмент от Livewire) заставили свои агенты драйвить
+настоящий UI и перехватывать сетевые ответы страницы. Реальный захват
+трафика (`scripts/sso_capture_data.py`, живой прогон 2026-09-27,
+`sso_capture/responses.jsonl`) показал для SSO/студенческого портала
+совсем другую картину: `stud.satbayev.university` и
+`api.satbayev.university` отдают чистый, cookie-авторизованный JSON —
+никакого Bearer-токена, никакого UI-хендшейка. Поэтому `SsoAgent`
+(`agents/sso/agent.py`) делает прямые `context.request.get(...)` вызовы
+против:
+
+- `GET stud.satbayev.university/api/ScheduleTable/GetCurrentAndAvailableSemesters`
+- `GET stud.satbayev.university/api/ScheduleTable/GetDesciplines?semesterId=<id>`
+- `GET stud.satbayev.university/api/ScheduleTable/GetTable?semesterId=<id>`
+- `GET api.satbayev.university/api/Umkd/GetFoldersForStudent`
+- `GET api.satbayev.university/api/Umkd/GetFolderContent?folderId=<id>` (рекурсивно по каждой листовой папке дерева УМКД)
+
+Один лёгкий `page.goto()` на страницу расписания всё же происходит перед
+API-вызовами — не потому что это технически обязательно (cookies
+работают через `context.request` независимо), а чтобы трафик агента
+выглядел как обычный визит залогиненного браузера, а не как холодный
+скрипт, дёргающий внутренние эндпоинты (тот же принцип TZ v4 §3.4, что и
+у Teams/VALORANT).
+
+### Проверка сессии — тоже настоящий API, а не догадка по URL
+
+В отличие от Teams (`LOGGED_IN_URL_HINT` — угаданный URL) и VALORANT
+(`LOGIN_URL_HINT` — реальный, но всё же URL-based редирект), у SSO нашёлся
+специальный эндпоинт именно под этот вопрос:
+`GET api.satbayev.university/api/Auth/IsAuthenticated` → `true`.
+`SsoSession.is_logged_in()` (`agents/sso/auth.py`) читает его напрямую —
+никакого риска повторить баг с `wait_for_url()` против только что
+навигированного URL, который стоил реального времени на Teams (см. выше).
+**Честная оговорка**: захват сессии-протухания вживую не делался (сессия
+была валидна весь захват), так что это не подтверждённая форма ответа
+истёкшей сессии, а безопасный дефолт — любой не-200 или тело не `true`
+трактуется как "не залогинен".
+
+### Что агент осознанно НЕ делает
+
+- **Не скачивает файлы УМКД.** `GET api.satbayev.university/api/Umkd/Download?fileId=<id>`
+  никогда не вызывается — только метаданные (`fileId`/`fileName`/
+  `fileCategoryTitle`) идут в `sso_study_materials`.
+- **Никогда не вызывает `api.satbayev.university/api/user/getuserinfo`.**
+  Реальный ответ этого эндпоинта (виден в том же захвате) содержит `iin`
+  (казахстанский ИИН) и `dob` (дату рождения) — настоящие чувствительные
+  персональные данные, которые этому проекту не нужны и никогда не
+  должны попасть в БД/логи. Поскольку у `SsoAgent` нет причины вызывать
+  этот эндпоинт вообще, фильтровать поля просто не из чего — его нет в
+  списке вызовов.
+
+### Хранение — snapshot-replace, как у `valorant_store`
+
+`Database.save_sso_snapshot()` (`storage/database.py`) при каждом
+успешном прогоне полностью замещает `sso_courses`/`sso_schedule_entries`
+для данного `semester_id` и целиком `sso_study_materials` — как и у
+`valorant_store`, у расписания/УМКД пока нет устойчивого per-row
+идентификатора, по которому стоило бы отслеживать "это конкретно
+изменилось" (комната/время/преподаватель могут поменяться между
+прогонами без отдельного сигнала). Три новые таблицы описаны в
+`storage/models.py`.
+
+### Что не тронуто
+
+Auth Checker Agent, Checker Agent, Study Manager и Telegram Mini App из
+bro's ТЗ — вне рамок этого этапа, как и явно оговаривалось. У SSO Agent
+пока нет собственной команды в Telegram-боте — это территория Study
+Manager/Mini App.
+
 ## Тесты
 
-**127 тестов, все проходят**: 56 из Phase 2-4 (core infra, БД,
+**163 теста, все проходят**: 56 из Phase 2-4 (core infra, БД,
 scheduler/retry, Weather Agent, Telegram auth/wishlist, LLM provider —
 включая 4 для чата с Claude, `Handlers.chat`) + 43 из Phase 5 (18 для
 Teams-парсера, 8 для `TeamsSession` (включая 2 на исправленный
@@ -633,7 +708,20 @@ Teams-парсера, 8 для `TeamsSession` (включая 2 на испра�
 (`wait_for_load_state`) и 2 на скриншот-диагностику при падении — из
 Phase 6.3, см. выше) + 20 для
 VALORANT (Phase 6) + 8 в `test_telegram_handlers.py` для `/store` с
-картинками (Phase 6.3).
+картинками (Phase 6.3) + **36 новых для SSO Agent (Этап B)**: 18 в
+`test_sso_parser.py` (`pick_current_semester_id`, `parse_courses`,
+`parse_schedule` — включая чтение времени из container, а не из
+lesson, `iter_umkd_leaf_folders`/`build_umkd_path_by_folder_id`,
+`parse_materials`), 9 в `test_sso_auth.py` (`is_logged_in()`
+true/false по реальному ответу `Auth/IsAuthenticated`, не-JSON тело,
+`login_interactively()`/`SsoLoginTimeout`, пересоздание контекста при
+смене headless-режима), 6 в `test_sso_agent.py` (`SsoAgent.run()` на
+замоканном `context.request.get`: полный успешный прогон пишет в БД,
+`needs_reauth=True` когда сессия не залогинена, `FAILING` без
+`needs_reauth` когда семестров нет, одна упавшая папка УМКД не валит
+весь прогон, `aclose()` закрывает только свою сессию) + 3 прямых теста
+`save_sso_snapshot()`/`get_sso_*` в `test_database.py`
+(запись/замещение по семестру/изоляция между семестрами).
 
 - `tests/test_teams_parser.py` (18 тестов) — чистые функции
   `resolve_course_name`/`compute_status`/`parse_assignment`/

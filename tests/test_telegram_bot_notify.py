@@ -22,6 +22,7 @@ def _config(tmp_path) -> AppConfig:
         teams_interval_minutes=60,
         weather_interval_minutes=60,
         valorant_interval_minutes=120,
+        sso_interval_minutes=120,
         briefing_hour=8,
         included_courses=(),
         excluded_courses=(),
@@ -33,6 +34,7 @@ def _config(tmp_path) -> AppConfig:
         teams_profile_path=str(tmp_path / "teams_browser_profile"),
         teams_min_due_date=datetime(2026, 9, 1, tzinfo=timezone.utc),
         valorant_profile_path=str(tmp_path / "valorant_browser_profile"),
+        sso_profile_path=str(tmp_path / "sso_browser_profile"),
     )
 
 

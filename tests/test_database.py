@@ -12,7 +12,10 @@ def test_schema_creates_all_required_tables(tmp_db):
             ).fetchall()
         }
 
-    required = {"tasks", "weather_snapshots", "valorant_store", "notifications", "agent_runs"}
+    required = {
+        "tasks", "weather_snapshots", "valorant_store", "notifications", "agent_runs",
+        "sso_courses", "sso_schedule_entries", "sso_study_materials",
+    }
     assert required.issubset(tables)
 
 
@@ -97,6 +100,52 @@ def test_cleanup_removes_only_old_rows_from_valorant_store(tmp_db):
     with tmp_db.connect() as conn:
         remaining = conn.execute("SELECT COUNT(*) AS c FROM valorant_store").fetchone()["c"]
     assert remaining == 1
+
+
+def test_save_sso_snapshot_writes_courses_schedule_and_materials(tmp_db):
+    tmp_db.save_sso_snapshot(
+        semester_id=85,
+        courses=[{"code": "CSE5472", "title": "НИРС", "total_credits": 3}],
+        schedule_entries=[{"class_id": 222374, "course_code": "CSE5472", "day_title": "MONDAY_SHORT"}],
+        materials=[{"file_id": 1, "folder_id": 490059, "file_name": "Практика 1.docx"}],
+    )
+
+    assert len(tmp_db.get_sso_courses(85)) == 1
+    assert tmp_db.get_sso_courses(85)[0]["code"] == "CSE5472"
+    assert len(tmp_db.get_sso_schedule(85)) == 1
+    assert tmp_db.get_sso_schedule(85)[0]["class_id"] == 222374
+    assert len(tmp_db.get_sso_materials()) == 1
+    assert tmp_db.get_sso_materials()[0]["file_name"] == "Практика 1.docx"
+
+
+def test_save_sso_snapshot_replaces_the_previous_snapshot_for_that_semester(tmp_db):
+    tmp_db.save_sso_snapshot(
+        semester_id=85,
+        courses=[{"code": "OLD1", "title": "Old course"}],
+        schedule_entries=[{"class_id": 1, "day_title": "MONDAY_SHORT"}],
+        materials=[{"file_id": 1, "folder_id": 1, "file_name": "old.docx"}],
+    )
+    tmp_db.save_sso_snapshot(
+        semester_id=85,
+        courses=[{"code": "NEW1", "title": "New course"}],
+        schedule_entries=[{"class_id": 2, "day_title": "TUESDAY_SHORT"}],
+        materials=[{"file_id": 2, "folder_id": 2, "file_name": "new.docx"}],
+    )
+
+    courses = tmp_db.get_sso_courses(85)
+    assert [c["code"] for c in courses] == ["NEW1"]
+    schedule = tmp_db.get_sso_schedule(85)
+    assert [s["class_id"] for s in schedule] == [2]
+    materials = tmp_db.get_sso_materials()
+    assert [m["file_name"] for m in materials] == ["new.docx"]
+
+
+def test_save_sso_snapshot_does_not_touch_a_different_semesters_courses(tmp_db):
+    tmp_db.save_sso_snapshot(semester_id=80, courses=[{"code": "OLD", "title": "Old sem"}], schedule_entries=[], materials=[])
+    tmp_db.save_sso_snapshot(semester_id=85, courses=[{"code": "NEW", "title": "New sem"}], schedule_entries=[], materials=[])
+
+    assert [c["code"] for c in tmp_db.get_sso_courses(80)] == ["OLD"]
+    assert [c["code"] for c in tmp_db.get_sso_courses(85)] == ["NEW"]
 
 
 def test_cleanup_does_not_touch_tasks_or_notifications(tmp_db):

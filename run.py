@@ -1,12 +1,15 @@
-"""Entrypoint (Phase 6: + VALORANT Agent, on top of Phase 5's Teams Agent +
-Phase 4's Core Infrastructure + Telegram Bot + Weather Agent).
+"""Entrypoint (+ SSO Agent (Этап B) on top of Phase 6's VALORANT Agent,
+Phase 5's Teams Agent, Phase 4's Core Infrastructure + Telegram Bot +
+Weather Agent).
 
 Wires together config, logging, the single-instance guard, the SQLite
 database, the scheduler, the Telegram bot, and the Weather/Teams/
-VALORANT agents. The AI Manager that would aggregate/prioritize/
+VALORANT/SSO agents. The AI Manager that would aggregate/prioritize/
 summarize everything is still Phase 7 - /weather, /tasks, /store and
 /briefing now all show real data once the relevant agent has run at
-least once.
+least once. SSO Agent data (normalized schedule/УМКД) has no bot
+command of its own yet - that's Study Manager/Mini App territory,
+explicitly out of scope for this stage.
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ import logging
 import signal
 
 from agents.runner import run_and_record
+from agents.sso.agent import SsoAgent
 from agents.teams.agent import TeamsAgent
 from agents.valorant.agent import ValorantAgent
 from agents.weather import WeatherAgent
@@ -100,6 +104,25 @@ async def _valorant_cycle(agent: ValorantAgent, db: Database, bot: TelegramBot |
         )
 
 
+async def _sso_cycle(agent: SsoAgent, db: Database, bot: TelegramBot | None) -> None:
+    # Unlike _weather_cycle, SsoAgent.run() already writes its own rows
+    # (storage/database.py's save_sso_snapshot) as part of run() itself,
+    # same reasoning as _teams_cycle/_valorant_cycle above - nothing
+    # left to persist here.
+    result = await run_and_record(agent, db)
+
+    if result.data.get("needs_reauth"):
+        await _notify_needs_reauth(
+            bot,
+            dedupe_key="sso:needs_reauth",
+            text=(
+                "\U0001f393 SSO Agent: сессия sso.satbayev.university истекла.\n"
+                "Открой приложение на ПК и войди заново:\n"
+                "python -m scripts.sso_login_setup"
+            ),
+        )
+
+
 async def main() -> None:
     config = load_config()
     setup_logging(config.log_dir)
@@ -118,6 +141,7 @@ async def main() -> None:
     weather_agent: WeatherAgent | None = None
     teams_agent: TeamsAgent | None = None
     valorant_agent: ValorantAgent | None = None
+    sso_agent: SsoAgent | None = None
 
     # Everything from here on is inside one try/finally so that a failure
     # at ANY startup step (scheduler, the Telegram bot failing to reach
@@ -177,6 +201,21 @@ async def main() -> None:
             func=lambda: _valorant_cycle(valorant_agent, db, bot),
         )
 
+        # No on/off config flag for SSO either, same reasoning as Teams/
+        # VALORANT above - the persistent SSO profile is the gate: if
+        # scripts/sso_login_setup.py hasn't been run locally yet, this
+        # still starts fine and every cycle reports FAILING with
+        # needs_reauth (agents/sso/agent.py catches its own auth errors).
+        sso_agent = SsoAgent(
+            profile_dir=config.sso_profile_path,
+            db=db,
+        )
+        scheduler.register(
+            job_id="sso_check",
+            interval_minutes=config.sso_interval_minutes,
+            func=lambda: _sso_cycle(sso_agent, db, bot),
+        )
+
         scheduler.start()
 
         if weather_agent is not None:
@@ -214,6 +253,13 @@ async def main() -> None:
             # Telegram notification right away, instead of silently
             # waiting for the next scheduled cycle.
             await _valorant_cycle(valorant_agent, db, bot)
+
+        if sso_agent is not None:
+            # Same immediate-first-run rationale as weather/teams/
+            # valorant above - placed AFTER the bot is constructed so a
+            # needs_reauth found on this very first run can still
+            # trigger the Telegram notification right away.
+            await _sso_cycle(sso_agent, db, bot)
 
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -271,6 +317,11 @@ async def main() -> None:
                 await valorant_agent.aclose()
             except Exception:  # noqa: BLE001 - best-effort cleanup boundary
                 logger.exception("Error while closing the VALORANT Agent's browser session")
+        if sso_agent is not None:
+            try:
+                await sso_agent.aclose()
+            except Exception:  # noqa: BLE001 - best-effort cleanup boundary
+                logger.exception("Error while closing the SSO Agent's browser session")
         try:
             await scheduler.shutdown(wait=True)
         except Exception:  # noqa: BLE001 - best-effort cleanup boundary

@@ -20,6 +20,7 @@ def _config(**overrides) -> AppConfig:
         teams_interval_minutes=60,
         weather_interval_minutes=60,
         valorant_interval_minutes=120,
+        sso_interval_minutes=120,
         briefing_hour=8,
         included_courses=(),
         excluded_courses=(),
@@ -31,6 +32,7 @@ def _config(**overrides) -> AppConfig:
         teams_profile_path="data/teams_browser_profile",
         teams_min_due_date=datetime(2026, 9, 1, tzinfo=timezone.utc),
         valorant_profile_path="data/valorant_browser_profile",
+        sso_profile_path="data/sso_browser_profile",
     )
     base.update(overrides)
     return AppConfig(**base)

@@ -123,6 +123,115 @@ class Database:
                 (json.dumps(payload, ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
             )
 
+    # -- sso_courses / sso_schedule_entries / sso_study_materials (SSO Agent, Этап B) --
+
+    def save_sso_snapshot(
+        self,
+        semester_id: int,
+        courses: list[dict],
+        schedule_entries: list[dict],
+        materials: list[dict],
+    ) -> None:
+        """Replaces the whole normalized snapshot for ``semester_id`` in
+        one transaction - see storage/models.py's schema comment for why
+        this is wipe-and-replace rather than a per-row upsert (no stable
+        per-row identity worth tracking yet at this stage). Materials
+        aren't semester-scoped (real UMKD folders span multiple academic
+        years per course), so they're wiped and re-inserted in full on
+        every run regardless of which semester was fetched.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            conn.execute("DELETE FROM sso_courses WHERE semester_id = ?", (semester_id,))
+            for course in courses:
+                conn.execute(
+                    """
+                    INSERT INTO sso_courses
+                        (code, semester_id, title, discipline_type_title, cycle_title,
+                         lecture_credits, practice_credits, lab_credits, total_credits,
+                         reading_chair_title, description, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        course["code"],
+                        semester_id,
+                        course["title"],
+                        course.get("discipline_type_title"),
+                        course.get("cycle_title"),
+                        course.get("lecture_credits"),
+                        course.get("practice_credits"),
+                        course.get("lab_credits"),
+                        course.get("total_credits"),
+                        course.get("reading_chair_title"),
+                        course.get("description"),
+                        now,
+                    ),
+                )
+
+            conn.execute("DELETE FROM sso_schedule_entries WHERE semester_id = ?", (semester_id,))
+            for entry in schedule_entries:
+                conn.execute(
+                    """
+                    INSERT INTO sso_schedule_entries
+                        (semester_id, class_id, course_code, course_title, instructor_name,
+                         room_title, class_type, day_title, start_time, end_time,
+                         group_number, students_count, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        semester_id,
+                        entry.get("class_id"),
+                        entry.get("course_code"),
+                        entry.get("course_title"),
+                        entry.get("instructor_name"),
+                        entry.get("room_title"),
+                        entry.get("class_type"),
+                        entry.get("day_title"),
+                        entry.get("start_time"),
+                        entry.get("end_time"),
+                        entry.get("group_number"),
+                        entry.get("students_count"),
+                        now,
+                    ),
+                )
+
+            conn.execute("DELETE FROM sso_study_materials")
+            for material in materials:
+                conn.execute(
+                    """
+                    INSERT INTO sso_study_materials
+                        (file_id, folder_id, file_name, file_category_title,
+                         course_title, instructor_name, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        material["file_id"],
+                        material["folder_id"],
+                        material["file_name"],
+                        material.get("file_category_title"),
+                        material.get("course_title"),
+                        material.get("instructor_name"),
+                        now,
+                    ),
+                )
+
+    def get_sso_courses(self, semester_id: int) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM sso_courses WHERE semester_id = ? ORDER BY code", (semester_id,)
+            ).fetchall()
+
+    def get_sso_schedule(self, semester_id: int) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM sso_schedule_entries WHERE semester_id = ? ORDER BY day_title, start_time",
+                (semester_id,),
+            ).fetchall()
+
+    def get_sso_materials(self) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM sso_study_materials ORDER BY file_name").fetchall()
+
     # -- notifications (dedup, TZ v4 §20/§22) ----------------------------
 
     def was_notified(self, kind: str, dedupe_key: str) -> bool:
