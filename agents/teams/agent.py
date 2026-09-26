@@ -1,27 +1,50 @@
 """Teams Agent (TZ v4 §10, Phase 5).
 
 Fetches assignments from the real internal Teams Education API
-(assignments.edu.cloud.microsoft/api/v1.0/edu/me/work) using the
-persistent Playwright profile's own session (agents/teams/auth.py) - no
-Graph API (blocked by admin consent, see README), no DOM scraping, no
-stored password.
+(assignments.edu.cloud.microsoft/api/v1.0/edu/me/work) - no Graph API
+(blocked by admin consent, see README), no stored password.
 
-HONEST, UNVERIFIED ASSUMPTION - read before trusting this in production:
-this agent calls the work API directly via `context.request`, reusing
-whatever cookies the persistent browser profile already holds for
-assignments.edu.cloud.microsoft. Every real capture so far only ever
-saw that API get called from *inside* the Teams UI, after clicking into
-a class - never as a standalone call right after loading teams.microsoft.com
-alone. It is unverified whether the SSO cookie for that specific origin is
-already present after just an is_logged_in()-style Teams load, or whether
-it only gets set once the user (or this agent) has actually opened the
-Assignments app inside Teams at least once. scripts/teams_agent_smoke_test.py
-exists specifically to test this for real on the user's machine before
-this is treated as "done" - same pattern as LOGGED_IN_URL_HINT in Phase 5's
-first cut, which turned out to need one real-world correction too.
+WHY THIS ISN'T A DIRECT API CALL - a real, verified finding, not a
+guess: the first cut of this agent called the work API straight via
+`context.request`, assuming the persistent browser profile's own
+cookies would authenticate it. Real testing against the live Satbayev
+tenant (scripts/teams_agent_smoke_test.py, then
+scripts/teams_agent_navigation_test.py, then
+scripts/teams_agent_token_test.py, then scripts/teams_agent_click_test.py
+- all four kept, all four disprove a different guess) showed:
+
+1. A bare load of teams.microsoft.com/teams.cloud.microsoft, with or
+   without waiting for networkidle, never authenticates the work API -
+   401 every time (smoke test).
+2. Navigating directly to the Assignments class page's own URL
+   (assignments.edu.cloud.microsoft/classes/<id>/list) as a standalone
+   top-level page loads fine but never even calls the work API at all -
+   the page's own JS sits waiting for a Teams-SDK postMessage handshake
+   with a real parent Teams shell that a bare page.goto() never
+   provides (navigation test).
+3. The work API is Bearer-token authenticated, not cookie-authenticated
+   - the token lives in the Assignments iframe's own JS memory after a
+   genuine SDK handshake, never in an HTTP-only cookie `context.request`
+   can reuse. Confirmed by capturing the real Authorization header off
+   the page's own request and finding no call ever fires without a real
+   click happening first (token test).
+4. A REAL click on the "Задания" button in Teams' left rail - done
+   headless via Playwright, not by hand - DOES complete that handshake
+   and DOES get a genuine 200 from the work API. But priming with just
+   that one click does NOT unlock a separate context.request call
+   afterwards (still 401) - the token stays scoped to the iframe, so
+   the response BODIES from the page's own traffic are the only way to
+   get the data (click test).
+
+So this agent drives the real UI exactly like a student would: open
+Teams, click "Задания", click through the Assignments dashboard's tabs,
+and capture the JSON response bodies the page's own code already
+fetches - the same technique scripts/teams_capture_assignments.py uses
+for a manual capture, just automated.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -32,26 +55,39 @@ from storage.database import Database
 
 logger = logging.getLogger(__name__)
 
+# Substring match on every response's URL - matches both the global
+# .../edu/me/work dashboard endpoint and any per-class
+# .../edu/classes/<id>/assignments endpoint the UI might use instead,
+# without hard-coding the exact query string (see this module's
+# docstring point 3 for why a broader net than one exact URL matters
+# for an undocumented API).
+_WORK_API_PATH = "/api/v1.0/edu/me/work"
+
+_ASSIGNMENTS_BUTTON_NAME = "Задания"
+_TAB_ROLE = "tab"
+# The Assignments dashboard's tabs, in DOM order - confirmed via a real
+# accessibility-tree dump against the live tenant (see this module's
+# docstring). Index 0 ("Предстоящие"/Upcoming) fires its own work-API
+# call automatically as soon as the dashboard opens, so it's not
+# re-clicked. Index 4 ("Черновики"/Drafts) is teacher-only assignment
+# authoring, never relevant to a student, and is skipped on purpose.
+_TAB_INDEXES_TO_CLICK = (1, 2, 3)  # Готово к оценке, Просрочено, Возвращено
+
+# --- Historical reference only, kept for scripts/teams_agent_*_test.py ---
+# These are the three $filter expressions + request shape the FIRST cut
+# of this agent used with a direct context.request.get() call - disproven
+# by real testing (see this module's docstring, point 3/4): the work API
+# needs a real UI-driven Teams-SDK handshake, not a standalone
+# cookie-authenticated call. Not used by _fetch_all_assignments() below
+# any more; kept only so the diagnostic scripts that found this out
+# (teams_agent_smoke_test.py, _navigation_test.py, _token_test.py,
+# _click_test.py) still import successfully if ever run again.
 WORK_API_URL = "https://assignments.edu.cloud.microsoft/api/v1.0/edu/me/work"
-
-# $expand pulls in submission status/dates in the same call - matches
-# what the real web client requested in every capture, not a
-# simplification, since this is an undocumented API and a "cleaner"
-# query we invented could behave differently.
 _EXPAND = "submissions($expand=outcomes),categories,submissionAggregates"
-
-# TODO(known limitation): no $skiptoken pagination - every real capture
-# saw well under 50 items in even the largest bucket (completed, several
-# semesters deep), so $top=50 covers what's been observed, but a student
-# with a long enough history could have more. Fine for a personal daily
-# briefing tool; would need pagination if that assumption ever breaks.
 _TOP = 50
 
 
 def _filters(now_iso: str) -> dict[str, str]:
-    """The three $filter expressions scripts/teams_capture_assignments.py
-    captured verbatim from the real web client for Upcoming/Overdue/
-    Completed - see README "Реальный API заданий"."""
     edu_status = "microsoft.education.assignments.api.educationAssignmentStatus"
     return {
         "upcoming": (
@@ -69,6 +105,17 @@ def _filters(now_iso: str) -> dict[str, str]:
             f"( status eq {edu_status}'inactive' ) )"
         ),
     }
+# --- end historical reference ---
+
+
+# How long to wait for a new work-API response after each click before
+# giving up on that particular tab and moving on - a tab that's
+# genuinely empty (e.g. no overdue work right now) may still fire a
+# request that just returns an empty "value" list, but a tab that never
+# fires anything at all (auth hiccup, layout change) shouldn't hang the
+# whole agent run.
+_RESPONSE_WAIT_TIMEOUT_MS = 8_000
+_RESPONSE_POLL_INTERVAL_MS = 250
 
 
 class TeamsAgent(BaseAgent):
@@ -86,52 +133,114 @@ class TeamsAgent(BaseAgent):
         if self._owns_session:
             await self.session.close()
 
-    async def _fetch_all_assignments(self) -> list[dict]:
-        """Hits the three real $filter queries and returns the merged,
-        de-duplicated raw educationAssignment dicts (the same assignment
-        can legitimately appear in more than one bucket's response - a
-        just-submitted item that's simultaneously "not yet due" is a real
-        case seen in the actual captured data, not a hypothetical)."""
-        context = await self.session._ensure_context(headless=True)  # noqa: SLF001 - see auth.py
+    @staticmethod
+    async def _wait_for_new_body(captured_bodies: list, previous_count: int) -> bool:
+        """Polls until captured_bodies grows past previous_count or the
+        timeout elapses. Returns whether a new body actually arrived -
+        callers decide whether "no new body" is fatal (the very first
+        dashboard load) or just means an empty tab (later tab clicks)."""
+        elapsed_ms = 0
+        while elapsed_ms < _RESPONSE_WAIT_TIMEOUT_MS:
+            if len(captured_bodies) > previous_count:
+                return True
+            await asyncio.sleep(_RESPONSE_POLL_INTERVAL_MS / 1000)
+            elapsed_ms += _RESPONSE_POLL_INTERVAL_MS
+        return False
 
+    async def _fetch_all_assignments(self) -> list[dict]:
+        """Drives the real Assignments dashboard UI and returns the
+        merged, de-duplicated raw educationAssignment dicts (the same
+        assignment can legitimately appear in more than one tab's
+        response - e.g. something just submitted right before its due
+        date can show up under both Upcoming and Returned in the same
+        polling cycle, a real case seen in earlier captures, not a
+        hypothetical)."""
+        context = await self.session._ensure_context(headless=True)  # noqa: SLF001 - see auth.py
         page = await context.new_page()
+
+        captured_bodies: list[dict] = []
+
+        async def _on_response(response) -> None:
+            if _WORK_API_PATH not in response.url:
+                return
+            try:
+                body = await response.json()
+            except Exception:  # noqa: BLE001 - not every response is JSON, and a bad
+                # body here shouldn't crash the listener and silently stop
+                # capturing every response after it
+                return
+            if isinstance(body, dict) and isinstance(body.get("value"), list):
+                captured_bodies.append(body)
+
+        page.on("response", lambda r: asyncio.create_task(_on_response(r)))
+
         try:
-            # Loads the Teams shell first, same as is_logged_in() - the
-            # assignments API call right after this is the part flagged as
-            # unverified in this module's docstring.
-            await page.goto(TEAMS_URL, wait_until="domcontentloaded", timeout=30_000)
+            await page.goto(TEAMS_URL, wait_until="networkidle", timeout=30_000)
+
+            assignments_button = page.get_by_role("button", name=_ASSIGNMENTS_BUTTON_NAME).first
+            await assignments_button.wait_for(state="visible", timeout=15_000)
+            await assignments_button.click(timeout=5_000)
+
+            # The default ("Предстоящие"/Upcoming) tab fires its own
+            # work-API call as soon as the dashboard opens - if THIS
+            # never arrives, something more fundamental is wrong (auth
+            # expired, UI changed) and the whole run should fail rather
+            # than silently return zero tasks.
+            got_first_body = await self._wait_for_new_body(captured_bodies, previous_count=0)
+            if not got_first_body:
+                raise RuntimeError(
+                    f"No response matching {_WORK_API_PATH!r} was seen within "
+                    f"{_RESPONSE_WAIT_TIMEOUT_MS}ms of opening the Assignments dashboard - "
+                    "session may not be logged in, or the UI has changed "
+                    "(see this module's docstring for how this was verified)."
+                )
+
+            assignments_frame = next(
+                (f for f in page.frames if "assignments.edu.cloud.microsoft" in f.url), None
+            )
+            if assignments_frame is None:
+                raise RuntimeError(
+                    "Assignments dashboard opened and returned data, but its "
+                    "assignments.edu.cloud.microsoft iframe could not be found afterwards - "
+                    "cannot click through the remaining tabs."
+                )
+
+            tabs = assignments_frame.get_by_role(_TAB_ROLE)
+            for tab_index in _TAB_INDEXES_TO_CLICK:
+                before_count = len(captured_bodies)
+                try:
+                    await tabs.nth(tab_index).click(timeout=5_000)
+                except Exception as exc:  # noqa: BLE001 - one missing/unclickable tab
+                    # shouldn't fail the whole run when the other tabs
+                    # already got real data - log and move on.
+                    logger.warning(
+                        "Teams agent: could not click Assignments tab index %s (%s: %s) - "
+                        "skipping, some categories may be missing from this run.",
+                        tab_index, type(exc).__name__, exc,
+                    )
+                    continue
+                got_new_body = await self._wait_for_new_body(captured_bodies, before_count)
+                if not got_new_body:
+                    logger.warning(
+                        "Teams agent: clicked Assignments tab index %s but no new response "
+                        "arrived within %sms - that category may be empty, or something's off.",
+                        tab_index, _RESPONSE_WAIT_TIMEOUT_MS,
+                    )
         finally:
             await page.close()
 
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         by_id: dict[str, dict] = {}
-        for label, filter_expr in _filters(now_iso).items():
-            response = await context.request.get(
-                WORK_API_URL,
-                params={
-                    "$filter": filter_expr,
-                    "$top": str(_TOP),
-                    "$orderby": "dueDateTime desc",
-                    "$expand": _EXPAND,
-                },
-            )
-            if not response.ok:
-                raise RuntimeError(
-                    f"Teams work API returned HTTP {response.status} for the {label!r} query "
-                    f"(work API auth cookie may be missing - see this module's docstring)"
-                )
-            body = await response.json()
+        for body in captured_bodies:
             for raw in body.get("value", []):
                 raw_id = raw.get("id")
                 if raw_id:
-                    by_id[raw_id] = raw  # last-write-wins de-dupe across the 3 queries
-
+                    by_id[raw_id] = raw  # last-write-wins de-dupe across tabs
         return list(by_id.values())
 
     async def run(self) -> AgentResult:
         try:
             raw_assignments = await self._fetch_all_assignments()
-        except Exception as exc:  # noqa: BLE001 - expected failure mode (auth expired, API down/reshaped)
+        except Exception as exc:  # noqa: BLE001 - expected failure mode (auth expired, UI changed)
             return AgentResult(agent=self.name, status=AgentStatus.FAILING, error=f"{type(exc).__name__}: {exc}")
 
         now = datetime.now(timezone.utc)

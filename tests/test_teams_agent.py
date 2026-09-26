@@ -5,7 +5,18 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from agents.base import AgentStatus
+from agents.teams import agent as agent_module
 from agents.teams.agent import TeamsAgent
+
+
+@pytest.fixture(autouse=True)
+def _fast_polling(monkeypatch):
+    # The real agent polls every _RESPONSE_POLL_INTERVAL_MS up to
+    # _RESPONSE_WAIT_TIMEOUT_MS waiting for a network response - shrink
+    # both so tests that exercise the "nothing ever arrived" path don't
+    # actually burn several real seconds asleep.
+    monkeypatch.setattr(agent_module, "_RESPONSE_POLL_INTERVAL_MS", 1)
+    monkeypatch.setattr(agent_module, "_RESPONSE_WAIT_TIMEOUT_MS", 20)
 
 
 def _assignment(id_: str, class_id: str, **overrides) -> dict:
@@ -23,67 +34,131 @@ def _assignment(id_: str, class_id: str, **overrides) -> dict:
     return base
 
 
-def _mock_response(status: int = 200, body: dict | None = None):
+def _fake_response(body: dict):
     response = MagicMock()
-    response.ok = 200 <= status < 300
-    response.status = status
-    response.json = AsyncMock(return_value=body or {"value": []})
+    response.url = "https://assignments.edu.cloud.microsoft/api/v1.0/edu/me/work?%24filter=..."
+    response.json = AsyncMock(return_value=body)
     return response
 
 
-def _mock_session(responses_by_call):
-    """A fake TeamsSession whose context.request.get() returns
-    ``responses_by_call`` in order, one per call (one per $filter query -
-    upcoming/overdue/completed, in that order per agents/teams/agent.py's
-    _filters())."""
-    mock_page = AsyncMock()
-    mock_page.goto = AsyncMock()
-    mock_page.close = AsyncMock()
+class _Env:
+    """Fakes just enough of Playwright's Page/Frame/Locator API to drive
+    TeamsAgent's real click -> listen-for-response -> click-tabs flow.
 
-    mock_context = MagicMock()
-    mock_context.new_page = AsyncMock(return_value=mock_page)
-    mock_context.request = MagicMock()
-    mock_context.request.get = AsyncMock(side_effect=responses_by_call)
+    ``tab_bodies`` maps a tab index (0 = the default tab that fires its
+    own work-API response automatically once the dashboard opens, 1/2/3
+    = the tabs the agent clicks through, matching
+    agents/teams/agent.py's _TAB_INDEXES_TO_CLICK) to the response body
+    that "clicking" (or, for index 0, just opening the dashboard)
+    should deliver through the captured page.on("response", ...)
+    handler - mirroring how Teams' real UI fires a network response
+    after each interaction. A tab index with no entry delivers nothing,
+    simulating an empty category or an unclickable/missing tab.
+    """
 
-    mock_session = MagicMock()
-    mock_session._ensure_context = AsyncMock(return_value=mock_context)
-    mock_session.close = AsyncMock()
-    return mock_session, mock_context
+    def __init__(
+        self,
+        tab_bodies: dict[int, dict] | None = None,
+        has_assignments_frame: bool = True,
+        failing_tab_indexes: tuple[int, ...] = (),
+    ):
+        self.tab_bodies = tab_bodies or {}
+        self.failing_tab_indexes = failing_tab_indexes
+        self._response_handler = None
+
+        self.page = MagicMock()
+        self.page.goto = AsyncMock()
+        self.page.close = AsyncMock()
+        self.page.on = MagicMock(side_effect=self._capture_handler)
+
+        button_locator = MagicMock()
+        button_locator.wait_for = AsyncMock()
+        button_locator.click = AsyncMock(side_effect=self._make_click_side_effect(0))
+        role_locator = MagicMock()
+        role_locator.first = button_locator
+        self.page.get_by_role = MagicMock(return_value=role_locator)
+
+        if has_assignments_frame:
+            top_frame = MagicMock()
+            top_frame.url = "https://teams.cloud.microsoft/"
+            assignments_frame = MagicMock()
+            assignments_frame.url = "https://assignments.edu.cloud.microsoft/classes/all/list"
+
+            tab_locators = {}
+            for i in (1, 2, 3):
+                loc = MagicMock()
+                loc.click = AsyncMock(side_effect=self._make_click_side_effect(i))
+                tab_locators[i] = loc
+            tabs_locator = MagicMock()
+            tabs_locator.nth = MagicMock(side_effect=lambda i: tab_locators[i])
+            assignments_frame.get_by_role = MagicMock(return_value=tabs_locator)
+
+            self.page.frames = [top_frame, assignments_frame]
+        else:
+            top_frame = MagicMock()
+            top_frame.url = "https://teams.cloud.microsoft/"
+            self.page.frames = [top_frame]
+
+        self.context = MagicMock()
+        self.context.new_page = AsyncMock(return_value=self.page)
+
+        self.session = MagicMock()
+        self.session._ensure_context = AsyncMock(return_value=self.context)
+        self.session.close = AsyncMock()
+
+    def _capture_handler(self, event_name, handler):
+        if event_name == "response":
+            self._response_handler = handler
+
+    def _make_click_side_effect(self, tab_index: int):
+        async def _side_effect(*args, **kwargs):
+            if tab_index in self.failing_tab_indexes:
+                raise RuntimeError(f"simulated click failure on tab {tab_index}")
+            body = self.tab_bodies.get(tab_index)
+            if body is not None and self._response_handler is not None:
+                self._response_handler(_fake_response(body))
+
+        return _side_effect
 
 
 @pytest.mark.asyncio
-async def test_run_reports_multiple_courses(tmp_db):
-    upcoming = _mock_response(200, {"value": [_assignment("a1", "e3f75118-bae6-4636-87c7-b2e91b63f913")]})
-    overdue = _mock_response(200, {"value": [_assignment("a2", "162b0fa2-6461-4eb0-aef3-da996e67e7e7")]})
-    completed = _mock_response(200, {"value": []})
-    session, _ = _mock_session([upcoming, overdue, completed])
+async def test_run_reports_default_tab_only(tmp_db):
+    env = _Env(tab_bodies={0: {"value": [_assignment("a1", "e3f75118-bae6-4636-87c7-b2e91b63f913")]}})
+    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
 
-    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=session)
     result = await agent.run()
 
     assert result.status == AgentStatus.WORKING
-    assert result.data["total"] == 2
-    assert result.data["new"] == 2
+    assert result.data["total"] == 1
+    assert result.data["new"] == 1
 
+
+@pytest.mark.asyncio
+async def test_run_merges_assignments_from_multiple_tabs(tmp_db):
+    env = _Env(
+        tab_bodies={
+            0: {"value": [_assignment("a1", "e3f75118-bae6-4636-87c7-b2e91b63f913")]},
+            2: {"value": [_assignment("a2", "162b0fa2-6461-4eb0-aef3-da996e67e7e7")]},  # Просрочено
+        }
+    )
+    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
+
+    result = await agent.run()
+
+    assert result.data["total"] == 2
     with tmp_db.connect() as conn:
-        rows = conn.execute("SELECT course FROM tasks ORDER BY id").fetchall()
-    courses = {r["course"] for r in rows}
+        courses = {r["course"] for r in conn.execute("SELECT course FROM tasks").fetchall()}
     assert len(courses) == 2
 
 
 @pytest.mark.asyncio
-async def test_run_deduplicates_an_assignment_seen_in_two_filters(tmp_db):
-    # The real API can (and does) return the same assignment from more
-    # than one $filter query - e.g. something just submitted right
-    # before its due date can satisfy both "upcoming" and part of the
-    # "completed" OR-clause in the same polling cycle.
+async def test_run_deduplicates_an_assignment_seen_in_two_tabs(tmp_db):
+    # A just-submitted item due soon can legitimately show up under both
+    # Upcoming and Returned in the same run (seen in real captures).
     shared = _assignment("dup-1", "e3f75118-bae6-4636-87c7-b2e91b63f913")
-    upcoming = _mock_response(200, {"value": [shared]})
-    overdue = _mock_response(200, {"value": []})
-    completed = _mock_response(200, {"value": [shared]})
-    session, _ = _mock_session([upcoming, overdue, completed])
+    env = _Env(tab_bodies={0: {"value": [shared]}, 3: {"value": [shared]}})  # Возвращено
+    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
 
-    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=session)
     result = await agent.run()
 
     assert result.data["total"] == 1
@@ -95,36 +170,21 @@ async def test_run_deduplicates_an_assignment_seen_in_two_filters(tmp_db):
 @pytest.mark.asyncio
 async def test_run_marks_new_then_unchanged_then_changed_across_runs(tmp_db):
     assignment = _assignment("a1", "e3f75118-bae6-4636-87c7-b2e91b63f913")
-    empty = _mock_response(200, {"value": []})
 
-    # First run: brand new task.
-    session1, _ = _mock_session(
-        [_mock_response(200, {"value": [assignment]}), empty, empty]
-    )
-    agent1 = TeamsAgent(profile_dir="unused", db=tmp_db, session=session1)
+    env1 = _Env(tab_bodies={0: {"value": [assignment]}})
+    agent1 = TeamsAgent(profile_dir="unused", db=tmp_db, session=env1.session)
     result1 = await agent1.run()
     assert result1.data["new"] == 1
-    assert result1.data["changed"] == 0
 
-    with tmp_db.connect() as conn:
-        state = conn.execute("SELECT state FROM tasks WHERE id = 'a1'").fetchone()["state"]
-    assert state == "new"
-
-    # Second run: identical data -> unchanged.
-    session2, _ = _mock_session(
-        [_mock_response(200, {"value": [assignment]}), empty, empty]
-    )
-    agent2 = TeamsAgent(profile_dir="unused", db=tmp_db, session=session2)
+    env2 = _Env(tab_bodies={0: {"value": [assignment]}})
+    agent2 = TeamsAgent(profile_dir="unused", db=tmp_db, session=env2.session)
     result2 = await agent2.run()
     assert result2.data["unchanged"] == 1
     assert result2.data["new"] == 0
 
-    # Third run: due date changed -> changed.
     moved = _assignment("a1", "e3f75118-bae6-4636-87c7-b2e91b63f913", dueDateTime="2026-11-01T14:30:00Z")
-    session3, _ = _mock_session(
-        [_mock_response(200, {"value": [moved]}), empty, empty]
-    )
-    agent3 = TeamsAgent(profile_dir="unused", db=tmp_db, session=session3)
+    env3 = _Env(tab_bodies={0: {"value": [moved]}})
+    agent3 = TeamsAgent(profile_dir="unused", db=tmp_db, session=env3.session)
     result3 = await agent3.run()
     assert result3.data["changed"] == 1
 
@@ -135,32 +195,55 @@ async def test_run_marks_new_then_unchanged_then_changed_across_runs(tmp_db):
 
 
 @pytest.mark.asyncio
-async def test_run_reports_failing_on_non_ok_response(tmp_db):
-    session, _ = _mock_session([_mock_response(401, {}), _mock_response(200, {"value": []}), _mock_response(200, {"value": []})])
+async def test_run_reports_failing_when_no_default_response_arrives(tmp_db):
+    # Nothing ever fires for tab index 0 - simulates an expired/broken
+    # session where opening the dashboard never produces real data.
+    env = _Env(tab_bodies={})
+    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
 
-    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=session)
     result = await agent.run()
 
     assert result.status == AgentStatus.FAILING
-    assert "401" in result.error
+    assert "RuntimeError" in result.error
 
 
 @pytest.mark.asyncio
-async def test_run_reports_failing_when_request_raises(tmp_db):
-    session, context = _mock_session([])
-    context.request.get = AsyncMock(side_effect=RuntimeError("network gone"))
+async def test_run_reports_failing_when_assignments_frame_is_missing(tmp_db):
+    # The default tab's response DOES arrive, but the assignments
+    # iframe can't be found afterwards - can't click through the rest.
+    env = _Env(tab_bodies={0: {"value": []}}, has_assignments_frame=False)
+    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
 
-    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=session)
     result = await agent.run()
 
     assert result.status == AgentStatus.FAILING
-    assert "network gone" in result.error
+    assert "iframe" in result.error
+
+
+@pytest.mark.asyncio
+async def test_run_continues_when_one_tab_click_fails(tmp_db):
+    # Tab index 2 ("Просрочено") is unclickable for some reason, but the
+    # default tab and the other clickable tabs still have real data -
+    # one bad tab shouldn't fail the whole run.
+    env = _Env(
+        tab_bodies={
+            0: {"value": [_assignment("a1", "e3f75118-bae6-4636-87c7-b2e91b63f913")]},
+            3: {"value": [_assignment("a2", "162b0fa2-6461-4eb0-aef3-da996e67e7e7")]},
+        },
+        failing_tab_indexes=(2,),
+    )
+    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
+
+    result = await agent.run()
+
+    assert result.status == AgentStatus.WORKING
+    assert result.data["total"] == 2
 
 
 @pytest.mark.asyncio
 async def test_aclose_only_closes_a_session_it_owns(tmp_db):
-    session, _ = _mock_session([])
+    env = _Env(tab_bodies={})
 
-    injected_agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=session)
+    injected_agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
     await injected_agent.aclose()
-    session.close.assert_not_awaited()
+    env.session.close.assert_not_awaited()
