@@ -3,9 +3,10 @@
 Локальная система персональной автоматизации (Teams / Weather / VALORANT →
 AI Manager → Telegram). Полное ТЗ см. `TZ_v4.md` (хранится отдельно).
 
-**Текущее состояние: Phase 5 — Teams Agent, инфраструктура (в процессе).**
-Полноценного парсера заданий ещё нет — см. "Что дальше" ниже, это не
-недоделка, а осознанная остановка перед сбором реальных данных.
+**Текущее состояние: Phase 6 — VALORANT Agent (Stack B) реализован.**
+Teams Agent (Phase 5) и VALORANT Agent (Phase 6) оба закончены и
+подключены в `run.py`; следующий шаг — Phase 7, AI Manager
+(агрегация/приоритизация/LLM-сводка поверх всех трёх источников).
 
 ## Что уже есть
 
@@ -14,10 +15,11 @@ AI Manager → Telegram). Полное ТЗ см. `TZ_v4.md` (хранится �
 | Core infra, Telegram bot, Weather Agent | — | ✅ Phase 2-4 |
 | **Microsoft Graph education API — проверено на реальном аккаунте** | — | ✅ VERIFIED: требует admin consent, недоступно студенту |
 | **Persistent Teams browser session** (Interactive Authentication) | `agents/teams/auth.py` | ✅ Phase 5, протестировано на моках Playwright |
-| Диагностический скрипт: первый интерактивный вход | `scripts/teams_login_setup.py` | ✅ готов к запуску пользователем |
-| Диагностический скрипт: захват реальной структуры Assignments | `scripts/teams_capture_assignments.py` | ✅ готов к запуску пользователем |
-| Парсер заданий Teams → `Task` model | `agents/teams/parser.py` | ⏳ ждёт реальных данных от диагностики |
-| Teams Agent (полный цикл run()) | `agents/teams/agent.py` | ⏳ то же |
+| Парсер заданий Teams → `Task` model + Teams Agent (полный цикл run()) | `agents/teams/parser.py`, `agents/teams/agent.py` | ✅ Phase 5, реальные данные подтверждены |
+| **Riot RSO (OAuth) — исследовано, недоступно для этого проекта** | — | ✅ VERIFIED: только approved production apps, и даже так не отдаёт Personal Store |
+| **Persistent Stack B browser session** | `agents/valorant/auth.py` | ✅ Phase 6, протестировано на моках Playwright |
+| Парсер магазина Stack B → skin rows + VALORANT Agent (полный цикл run()) | `agents/valorant/parser.py`, `agents/valorant/agent.py` | ✅ Phase 6, реальные данные подтверждены |
+| Диагностические скрипты (вход/захват трафика) | `scripts/teams_login_setup.py`, `scripts/teams_capture_assignments.py`, `scripts/valorant_login_setup.py`, `scripts/valorant_capture_store.py` | ✅ готовы к запуску пользователем |
 
 ## Phase 1 → Phase 5: закрытый вопрос про Graph API
 
@@ -189,6 +191,87 @@ JSON-ответы, которые сама страница уже получа�
 текст из-за скрытой метки для скринридера) подтверждены прямым дампом
 accessibility-дерева внутри iframe на живом тенанте — не угаданы.
 
+## Phase 6: VALORANT Agent — Stack B вместо RSO
+
+### Почему не официальный Riot API / RSO
+
+Прежде чем писать хоть строчку кода, исследовали два возможных
+источника личного ежедневного магазина VALORANT — **официальный RSO
+(Riot Sign-On)** и **официальный VALORANT API** — и оба оказались
+закрыты:
+
+- **RSO существует и безопасен** (OAuth2, пароль третья сторона не
+  получает), но **недоступен для хобби-проекта**: «RSO Clients are
+  only available for applications that have an existing, approved
+  production application ID» — сначала нужно одобренное
+  production-приложение, а на новые приложения Riot присылает
+  приглашение сама, self-serve регистрации нет
+  ([support-developer.riotgames.com](https://support-developer.riotgames.com/hc/en-us/articles/22801670382739-RSO-Riot-Sign-On)).
+- Даже если бы доступ был — **официальный VALORANT API магазин не
+  отдаёт в принципе**, ни при каком уровне доступа: прямым текстом в
+  документации, среди неодобряемых use-case'ов — «Online store
+  tracking or updates. The technology for this does not currently
+  exist in the API.»
+  ([developer.riotgames.com](https://developer.riotgames.com/docs/valorant)).
+- Третий возможный путь — локальный API самого запущенного клиента
+  VALORANT (`127.0.0.1` + `lockfile`, на чём построены community-
+  библиотеки вроде `python-valclient`) — отклонён по другой причине:
+  требует запущенную и залогиненную игру на том же ПК, то есть не
+  решает исходную задачу «проверить магазин с телефона».
+
+**Итог**: [Stack B](https://stackb.net/valorant/store) — сторонний
+сервис, который сам проходит настоящий Riot-логин и показывает
+персональный магазин через свой веб-интерфейс — единственный
+практически доступный источник. Подтверждено реальным перехватом
+трафика (`scripts/valorant_capture_store.py`,
+`valorant_capture/responses.jsonl`): настоящие данные магазина
+действительно приходят именно так.
+
+### Как Stack B на самом деле отдаёт магазин
+
+У Stack B **нет документированного JSON API** для магазина. Реальный
+перехваченный трафик показал:
+
+- `GET /riot/storefront` возвращает только пустую оболочку страницы —
+  Livewire-компонент `storefront` монтируется без товаров;
+- сами товары приходят отдельным `POST /livewire/update`, который
+  компонент `storefront` сам вызывает через `wire:init="getDailyItems()"`
+  сразу после монтирования — и в ответе `effects.html` содержит уже
+  полностью отрендеренный на сервере HTML-фрагмент (не структурированный
+  JSON: поле `snapshot.data.dailyItems` — это внутренние ID строк БД, а
+  не сами товары);
+- каждая карточка скина — это `<div class="skin-card" onclick="window.openValorantItem('<uuid>')">`
+  с `<img alt="Название">` и ценой прямо перед иконкой VP.
+
+`agents/valorant/agent.py` открывает `/riot/storefront` headless-браузером
+(сохранённая сессия Stack B, `agents/valorant/auth.py`) и перехватывает
+именно этот `POST /livewire/update` — та же техника «слушать реальный
+трафик страницы», что и `TeamsAgent` (см. Phase 5 выше). Затем
+`agents/valorant/parser.py` регэкспом достаёт `{uuid, name, price_vp,
+image_url}` из HTML-фрагмента — подтверждено на 4 реальных товарах из
+настоящего захвата.
+
+### Две разные, специально различаемые ошибки
+
+- **`needs_reauth`** — Stack B редиректнул на `/login`: сессия
+  протухла, HTML тут ни при чём. `run.py` шлёт отдельное Telegram-
+  уведомление с инструкцией `python -m scripts.valorant_login_setup`
+  (дедуплицируется через `notifications`, как у остальных уведомлений).
+- **`VALORANT_STORE_PARSE_ERROR`** — сессия в порядке (редиректа на
+  `/login` не было), но парсер не нашёл ни одной карточки: значит,
+  Stack B поменял вёрстку. Намеренно **не** трактуется как «магазин
+  пуст сегодня» — настоящий магазин VALORANT никогда не бывает пустым.
+
+### Честная оговорка про стабильность
+
+Как и Teams API (Phase 5), это внутренний недокументированный backend
+чужого веб-клиента — контракта обратной совместимости нет, Stack B
+может поменять вёрстку без предупреждения. `parser.py` поэтому
+защитный по конструкции: одна нераспознанная карточка просто
+пропускается, а не роняет весь прогон — фатальным считается только
+случай «карточек не нашлось вообще» (`VALORANT_STORE_PARSE_ERROR`
+выше).
+
 ## Chat with Claude — без `/ask`, просто пиши
 
 Указываешь свой Claude API-ключ, и с ботом можно просто разговаривать —
@@ -210,26 +293,26 @@ accessibility-дерева внутри iframe на живом тенанте �
 
 **Важная честная оговорка**: это пока **обычный чат-проход**, не
 tool-calling роутер. На "Что там на сегодня?" Claude отвечает как
-обычный ассистент — он **не** лезет в БД за реальными заданиями/погодой
-и не притворяется, что уже знает твой день, даже несмотря на то, что
-`TeamsAgent`/`WeatherAgent` теперь реально кладут данные в `tasks`/
-`weather_snapshots`. Настоящий intent-routing (Claude сам решает
-вызвать `get_tasks()`/`get_weather()`/`get_valorant()` по смыслу
-сообщения) — это Phase 7 (AI Manager), и делать его раньше, чем
-VALORANT-агент тоже кладёт данные в БД, значило бы строить роутер
-поверх ещё не полного набора источников — почти наверняка придётся
-переписывать под финальный набор интерфейсов. Сначала: `TeamsAgent` —
-готово; следующий источник (VALORANT, Phase 6) → и только потом
-полноценный роутер поверх всего этого.
+обычный ассистент — он **не** лезет в БД за реальными заданиями/
+погодой/магазином и не притворяется, что уже знает твой день, даже
+несмотря на то, что `TeamsAgent`/`WeatherAgent`/`ValorantAgent` теперь
+реально кладут данные в `tasks`/`weather_snapshots`/`valorant_store`.
+Настоящий intent-routing (Claude сам решает вызвать
+`get_tasks()`/`get_weather()`/`get_valorant()` по смыслу сообщения) —
+это Phase 7 (AI Manager). Все три источника (Teams, Weather, VALORANT)
+теперь готовы — Phase 7 может строить роутер поверх финального набора
+интерфейсов, без риска переписывать его под источник, которого ещё не
+было.
 
 ## Тесты
 
-**93 теста, все проходят**: 64 из Phase 2-4/раннего Phase 5 (включая
-7 для `TeamsSession` на замоканных объектах Playwright и 4 для чата с
-Claude, `Handlers.chat`) + 20 для парсера + 11 для реального,
-click-driven `TeamsAgent`:
+**116 тестов, все проходят**: 60 из Phase 2-4 (core infra, БД,
+scheduler/retry, Weather Agent, Telegram bot/handlers/auth, wishlist,
+LLM provider — включая 4 для чата с Claude, `Handlers.chat`) + 36 из
+Phase 5 (18 для Teams-парсера, 7 для `TeamsSession`, 11 для реального,
+click-driven `TeamsAgent`) + 20 новых для VALORANT (Phase 6, ниже).
 
-- `tests/test_teams_parser.py` (20 тестов) — чистые функции
+- `tests/test_teams_parser.py` (18 тестов) — чистые функции
   `resolve_course_name`/`compute_status`/`parse_assignment`/
   `parse_work_response`/`parse_due` на реальной форме данных: приоритет
   returned > submitted > completed > overdue/upcoming, обработка
@@ -249,10 +332,34 @@ click-driven `TeamsAgent`:
   фильтр `min_due_date`: старое задание отсекается и не попадает в БД,
   задание без даты вообще не отсекается, без `min_due_date` фильтрация
   не работает вообще (обратная совместимость).
+- `tests/test_valorant_parser.py` (7 тестов) — `parse_storefront_items`
+  на HTML-фрагменте, структурно повторяющем реальную карточку Stack B
+  (Phase 6.2): извлечение всех карточек с правильными `uuid`/`name`/
+  `price_vp`, пустой список для не-магазинного HTML и для пустой
+  строки, дедупликация задвоенного `uuid` (карточка ссылается на себя
+  дважды — `onclick`/`onkeydown`), fallback-имя при пустом `alt`, плюс
+  `parse_reset_time_left` (есть значение / отсутствует / не строка).
+- `tests/test_valorant_auth.py` (7 тестов) — `ValorantSession` на
+  замоканных объектах Playwright, той же структуры, что и
+  `test_teams_auth.py`: `is_logged_in()` true/false по наличию редиректа
+  на `/login`, `login_interactively()` возвращает финальный URL (в том
+  числе не совпадающий с целевой страницей — как в реальном захвате,
+  где логин привёл на `/posts`, а не `/riot/storefront`), `TimeoutError`
+  → `ValorantLoginTimeout`, пересоздание контекста при смене
+  headless-режима, переиспользование при одинаковом режиме, `close()`.
+- `tests/test_valorant_agent.py` (6 тестов) — `ValorantAgent.run()` на
+  замоканных Playwright Page, перехватывающих `POST /livewire/update`:
+  успешный прогон сохраняет товары в БД и `reset_in`, посторонние
+  Livewire-компоненты (`live-comments` и т.п.) игнорируются, редирект на
+  `/login` → `FAILING` с `needs_reauth=True` (и ничего не пишется в БД),
+  ничего не пришло при валидной сессии → `FAILING` без `needs_reauth`,
+  ноль карточек в HTML → `FAILING` с `VALORANT_STORE_PARSE_ERROR` (и
+  ничего не пишется в БД), `aclose()` закрывает только свою сессию.
 
 Реальный браузер в тестах не запускается и не нужен нигде — вся
-логика Teams Agent (парсинг, дедупликация, change-detection,
-error-handling) протестирована на замоканных объектах.
+логика Teams Agent и VALORANT Agent (парсинг, дедупликация,
+change-detection, error-handling) протестирована на замоканных
+объектах.
 
 ```powershell
 pip install -r requirements.txt

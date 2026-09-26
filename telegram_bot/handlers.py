@@ -1,17 +1,18 @@
 """Command handlers (TZ v4 §23-27).
 
-None of these call an agent directly - Teams (Phase 5) and Weather
-(Phase 4) agents run on the scheduler in run.py and write to SQLite;
-VALORANT (Phase 6) doesn't exist yet, and neither does the AI
-Manager's aggregation/priority/LLM summary logic (Phase 7). Commands
-that would show agent data read straight from the SQLite tables Phase
-2 already built, and report honestly when there's nothing there yet
-instead of pretending - "нет данных" is now genuinely ambiguous
-between "agent not implemented" and "implemented but hasn't run/found
-anything yet", so the messages below say which one it is per agent.
+None of these call an agent directly - Teams (Phase 5), Weather
+(Phase 4) and VALORANT (Phase 6) agents all run on the scheduler in
+run.py and write to SQLite; only the AI Manager's aggregation/priority/
+LLM summary logic (Phase 7) doesn't exist yet. Commands that would show
+agent data read straight from the SQLite tables Phase 2 already built,
+and report honestly when there's nothing there yet instead of
+pretending - "нет данных" is genuinely ambiguous between "agent hasn't
+run yet" and "ran but found nothing", so the messages below say which
+one it is per agent.
 """
 from __future__ import annotations
 
+import json
 import logging
 
 from telegram import Update
@@ -24,13 +25,40 @@ from storage.wishlist import WishlistStore
 
 logger = logging.getLogger(__name__)
 
-# The three agents named in the TZ. teams (Phase 5) and weather (Phase 4)
-# are implemented and run on the scheduler; valorant (Phase 6) isn't yet -
-# /status reports on all three by name regardless, so the shape of the
-# command is already right and "never ran" reads the same either way.
+# The three agents named in the TZ - teams (Phase 5), weather (Phase 4)
+# and valorant (Phase 6) are all implemented now and run on the
+# scheduler. /status reports on all three by name.
 KNOWN_AGENTS = ("teams", "weather", "valorant")
 
 STATUS_MARKERS = {"working": "\u2705", "degraded": "\U0001f7e1", "failing": "\U0001f534"}
+
+
+def _format_store(skins_json: str, checked_at: str) -> str:
+    """Renders the payload storage.database.Database.save_valorant_store()
+    writes ({"items": [...], "reset_in": ...}) as a human-readable
+    message, instead of dumping raw JSON at the person. Falls back to
+    the raw JSON string for anything unexpected (an older row saved
+    before this shape existed, or a malformed one) rather than raising -
+    /store should never crash just because a stored row looks odd."""
+    try:
+        payload = json.loads(skins_json)
+        items = payload["items"]
+        assert isinstance(items, list)
+    except (json.JSONDecodeError, KeyError, TypeError, AssertionError):
+        return f"\U0001f3ae \u041c\u0430\u0433\u0430\u0437\u0438\u043d ({checked_at}):\n{skins_json}"
+
+    lines = [f"\U0001f3ae \u041c\u0430\u0433\u0430\u0437\u0438\u043d VALORANT (\u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u043e {checked_at}):"]
+    for item in items:
+        name = item.get("name", "?")
+        price = item.get("price_vp")
+        price_text = f"{price} VP" if price is not None else "\u0446\u0435\u043d\u0430 \u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u0430"
+        lines.append(f"\u2022 {name} \u2014 {price_text}")
+
+    reset_in = payload.get("reset_in")
+    if reset_in:
+        lines.append(f"\n\u23f3 \u0421\u0431\u0440\u043e\u0441 \u0447\u0435\u0440\u0435\u0437: {reset_in}")
+
+    return "\n".join(lines)
 
 
 class Handlers:
@@ -66,8 +94,7 @@ class Handlers:
         for agent in KNOWN_AGENTS:
             row = self.db.last_run(agent)
             if row is None:
-                not_implemented = " (агент не реализован)" if agent == "valorant" else ""
-                lines.append(f"\u26aa {agent}: ещё не запускался{not_implemented}")
+                lines.append(f"\u26aa {agent}: ещё не запускался")
             else:
                 marker = STATUS_MARKERS.get(row["status"], "\u2753")
                 lines.append(f"{marker} {agent}: {row['status']} (проверка {row['finished_at']})")
@@ -113,13 +140,11 @@ class Handlers:
             ).fetchone()
         if row is None:
             await update.message.reply_text(
-                "\U0001f3ae VALORANT\n\u26a0\ufe0f Магазин недоступен — "
-                "агент ещё не реализован (Phase 6)."
+                "\U0001f3ae VALORANT\n\u26a0\ufe0f Магазин недоступен — VALORANT Agent ещё "
+                "не запускался или не смог авторизоваться в Stack B. Проверь /status: valorant."
             )
             return
-        await update.message.reply_text(
-            f"\U0001f3ae Магазин ({row['checked_at']}):\n{row['skins_json']}"
-        )
+        await update.message.reply_text(_format_store(row["skins_json"], row["checked_at"]))
 
     async def briefing(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         with self.db.connect() as conn:
@@ -145,7 +170,7 @@ class Handlers:
         parts.append(
             f"\U0001f3ae VALORANT: обновлено {store_row['checked_at']}"
             if store_row
-            else "\U0001f3ae VALORANT: данных нет (VALORANT Agent не реализован)"
+            else "\U0001f3ae VALORANT: данных нет (VALORANT Agent ещё не запускался/не смог авторизоваться)"
         )
         parts.append("\n(Приоритизация и LLM-сводка появятся в Phase 7 — AI Manager.)")
         await update.message.reply_text("\n".join(parts))

@@ -58,6 +58,47 @@ def test_cleanup_removes_only_old_rows_from_prunable_tables(tmp_db):
     assert remaining == 1
 
 
+def test_save_valorant_store_writes_items_and_reset_time(tmp_db):
+    import json
+
+    tmp_db.save_valorant_store(
+        [{"uuid": "abc-123", "name": "Апертура", "price_vp": 1275, "image_url": "https://x/y.png"}],
+        reset_in="7 часов и 49 минут",
+    )
+
+    with tmp_db.connect() as conn:
+        row = conn.execute(
+            "SELECT skins_json, checked_at FROM valorant_store ORDER BY checked_at DESC LIMIT 1"
+        ).fetchone()
+    assert row is not None
+    payload = json.loads(row["skins_json"])
+    assert payload["items"][0]["name"] == "Апертура"
+    assert payload["items"][0]["price_vp"] == 1275
+    assert payload["reset_in"] == "7 часов и 49 минут"
+
+
+def test_cleanup_removes_only_old_rows_from_valorant_store(tmp_db):
+    old = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+    recent = datetime.now(timezone.utc).isoformat()
+
+    with tmp_db.connect() as conn:
+        conn.execute(
+            "INSERT INTO valorant_store (skins_json, checked_at) VALUES (?, ?)",
+            ('{"items": [], "reset_in": null}', old),
+        )
+        conn.execute(
+            "INSERT INTO valorant_store (skins_json, checked_at) VALUES (?, ?)",
+            ('{"items": [], "reset_in": null}', recent),
+        )
+
+    deleted = tmp_db.cleanup(retention_days=30)
+    assert deleted["valorant_store"] == 1
+
+    with tmp_db.connect() as conn:
+        remaining = conn.execute("SELECT COUNT(*) AS c FROM valorant_store").fetchone()["c"]
+    assert remaining == 1
+
+
 def test_cleanup_does_not_touch_tasks_or_notifications(tmp_db):
     tmp_db.mark_notified("agent_status_change", "teams:failing")
 

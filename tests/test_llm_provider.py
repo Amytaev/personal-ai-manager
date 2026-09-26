@@ -30,6 +30,7 @@ def _config(**overrides) -> AppConfig:
         wishlist_path="config/wishlist.json",
         teams_profile_path="data/teams_browser_profile",
         teams_min_due_date=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        valorant_profile_path="data/valorant_browser_profile",
     )
     base.update(overrides)
     return AppConfig(**base)

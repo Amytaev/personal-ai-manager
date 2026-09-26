@@ -90,7 +90,26 @@ async def test_store_honest_when_empty(handlers):
     await handlers.store(update, context)
 
     text = update.message.reply_text.call_args.args[0]
-    assert "не реализован" in text
+    assert "не запускался" in text
+
+
+@pytest.mark.asyncio
+async def test_store_formats_real_items_from_db(handlers, tmp_db):
+    tmp_db.save_valorant_store(
+        [
+            {"uuid": "88f1bcbd-4dfd-f2ef-8a2c-44b3baa26b3c", "name": "Апертура", "price_vp": 1275, "image_url": "https://example.com/a.png"},
+            {"uuid": "72b3bacc-48ac-85f7-ec38-5ab629654486", "name": "Куронами", "price_vp": 2375, "image_url": "https://example.com/b.png"},
+        ],
+        reset_in="7 часов и 49 минут",
+    )
+
+    update, context = _fake_update_and_context()
+    await handlers.store(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "Апертура" in text and "1275 VP" in text
+    assert "Куронами" in text and "2375 VP" in text
+    assert "7 часов и 49 минут" in text
 
 
 @pytest.mark.asyncio
@@ -101,7 +120,7 @@ async def test_briefing_reports_all_three_sections_as_empty(handlers):
     text = update.message.reply_text.call_args.args[0]
     assert "Teams Agent ещё не запускался" in text
     assert "Weather Agent не реализован" in text
-    assert "VALORANT Agent не реализован" in text
+    assert "VALORANT Agent ещё не запускался" in text
 
 
 @pytest.mark.asyncio

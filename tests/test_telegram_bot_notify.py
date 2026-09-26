@@ -32,6 +32,7 @@ def _config(tmp_path) -> AppConfig:
         wishlist_path=str(tmp_path / "wishlist.json"),
         teams_profile_path=str(tmp_path / "teams_browser_profile"),
         teams_min_due_date=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        valorant_profile_path=str(tmp_path / "valorant_browser_profile"),
     )
 
 

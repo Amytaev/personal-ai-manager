@@ -69,6 +69,7 @@ class AppConfig:
     wishlist_path: str
     teams_profile_path: str
     teams_min_due_date: datetime
+    valorant_profile_path: str
 
 
 def load_config() -> AppConfig:
@@ -92,6 +93,10 @@ def load_config() -> AppConfig:
         lock_file_path=os.getenv("LOCK_FILE_PATH", "data/.instance.lock"),
         wishlist_path=os.getenv("WISHLIST_PATH", "config/wishlist.json"),
         teams_profile_path=os.getenv("TEAMS_PROFILE_PATH", "data/teams_browser_profile"),
+        # Same default as scripts/valorant_capture_store.py's PROFILE_DIR
+        # (the Phase 6.1 investigation script) - reuses that already
+        # logged-in session by default instead of forcing a second login.
+        valorant_profile_path=os.getenv("VALORANT_PROFILE_PATH", "data/valorant_browser_profile"),
         # Assignments due before this are dropped by TeamsAgent before
         # anything is saved to the DB - stale/old-semester noise
         # (confirmed for real: the unresolved classId 46191dc6 turned

@@ -1,12 +1,12 @@
-"""Entrypoint (Phase 5: + Teams Agent, on top of Phase 4's Core
-Infrastructure + Telegram Bot + Weather Agent).
+"""Entrypoint (Phase 6: + VALORANT Agent, on top of Phase 5's Teams Agent +
+Phase 4's Core Infrastructure + Telegram Bot + Weather Agent).
 
 Wires together config, logging, the single-instance guard, the SQLite
-database, the scheduler, the Telegram bot, the Weather Agent and now
-the Teams Agent. VALORANT is still Phase 6, and the AI Manager that
-would aggregate/prioritize/summarize everything is Phase 7 - /store
-still says so honestly; /weather, /tasks and /briefing now show real
-data once the relevant agent has run at least once.
+database, the scheduler, the Telegram bot, and the Weather/Teams/
+VALORANT agents. The AI Manager that would aggregate/prioritize/
+summarize everything is still Phase 7 - /weather, /tasks, /store and
+/briefing now all show real data once the relevant agent has run at
+least once.
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import signal
 
 from agents.runner import run_and_record
 from agents.teams.agent import TeamsAgent
+from agents.valorant.agent import ValorantAgent
 from agents.weather import WeatherAgent
 from config import load_config
 from logging_config import setup_logging
@@ -53,6 +54,35 @@ async def _weather_cycle(agent: WeatherAgent, db: Database) -> None:
             )
 
 
+async def _valorant_cycle(agent: ValorantAgent, db: Database, bot: TelegramBot | None) -> None:
+    # Unlike _weather_cycle, ValorantAgent.run() already writes its own
+    # row (storage/database.py's save_valorant_store) as part of run()
+    # itself, same reasoning as _teams_cycle above - nothing left to
+    # persist here.
+    result = await run_and_record(agent, db)
+
+    # bro's Phase 6.3 review: a stale Stack B session needs a DISTINCT
+    # Telegram notification ("go log back in on your PC"), not just a
+    # silent red marker in /status - since, unlike Teams (whose session
+    # only matters for a scheduled check nobody's waiting on), a stale
+    # VALORANT session means the person may be stuck away from their PC
+    # with no way to fix it themselves until they notice. `bot` may
+    # still be None here (this can run once before the bot is
+    # constructed, at startup - see main() below) - skip the
+    # notification rather than crash the cycle either way, run_and_record
+    # already recorded the failure in agent_runs regardless.
+    if bot is not None and result.data.get("needs_reauth"):
+        await bot.notify(
+            kind="agent_status_change",
+            dedupe_key="valorant:needs_reauth",
+            text=(
+                "\U0001f3ae VALORANT Agent: сессия Stack B истекла.\n"
+                "Открой приложение на ПК и войди в Stack B заново:\n"
+                "python -m scripts.valorant_login_setup"
+            ),
+        )
+
+
 async def main() -> None:
     config = load_config()
     setup_logging(config.log_dir)
@@ -70,6 +100,7 @@ async def main() -> None:
     bot: TelegramBot | None = None
     weather_agent: WeatherAgent | None = None
     teams_agent: TeamsAgent | None = None
+    valorant_agent: ValorantAgent | None = None
 
     # Everything from here on is inside one try/finally so that a failure
     # at ANY startup step (scheduler, the Telegram bot failing to reach
@@ -110,6 +141,25 @@ async def main() -> None:
             func=lambda: _teams_cycle(teams_agent, db),
         )
 
+        # No on/off config flag for VALORANT either, same reasoning as
+        # Teams above - the persistent Stack B profile is the gate: if
+        # scripts/valorant_login_setup.py hasn't been run locally yet,
+        # this still starts fine and every cycle reports FAILING with
+        # needs_reauth (agents/valorant/agent.py catches its own auth
+        # errors). `bot` is read from this enclosing scope at CALL time,
+        # not at registration time - it's still None here but will hold
+        # the real TelegramBot by the time this job actually fires
+        # (ordinary Python late-binding closure, same as `db` above).
+        valorant_agent = ValorantAgent(
+            profile_dir=config.valorant_profile_path,
+            db=db,
+        )
+        scheduler.register(
+            job_id="valorant_check",
+            interval_minutes=config.valorant_interval_minutes,
+            func=lambda: _valorant_cycle(valorant_agent, db, bot),
+        )
+
         scheduler.start()
 
         if weather_agent is not None:
@@ -135,6 +185,14 @@ async def main() -> None:
             logger.warning(
                 "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set - running without the Telegram bot"
             )
+
+        if valorant_agent is not None:
+            # Same immediate-first-run rationale as weather/teams above -
+            # placed AFTER the bot is constructed (unlike those two) so
+            # that a needs_reauth found on this very first run can still
+            # trigger the Telegram notification right away, instead of
+            # silently waiting for the next scheduled cycle.
+            await _valorant_cycle(valorant_agent, db, bot)
 
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -187,6 +245,11 @@ async def main() -> None:
                 await teams_agent.aclose()
             except Exception:  # noqa: BLE001 - best-effort cleanup boundary
                 logger.exception("Error while closing the Teams Agent's browser session")
+        if valorant_agent is not None:
+            try:
+                await valorant_agent.aclose()
+            except Exception:  # noqa: BLE001 - best-effort cleanup boundary
+                logger.exception("Error while closing the VALORANT Agent's browser session")
         try:
             await scheduler.shutdown(wait=True)
         except Exception:  # noqa: BLE001 - best-effort cleanup boundary

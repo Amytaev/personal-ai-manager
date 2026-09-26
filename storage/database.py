@@ -6,6 +6,7 @@ pool needed, and it keeps SQLite's locking model simple.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -104,6 +105,24 @@ class Database:
                 ),
             )
 
+    # -- valorant_store (VALORANT Agent, Phase 6) ------------------------
+
+    def save_valorant_store(self, items: list[dict], reset_in: str | None = None) -> None:
+        """Stores one snapshot of the daily store as a single JSON row -
+        unlike tasks (which are upserted by id for per-task change
+        detection), the store is a whole-day snapshot with no natural
+        per-item identity to track across days, so it's simply appended,
+        same shape as weather_snapshots. `reset_in` is folded into the
+        stored payload rather than a separate column, so /store and
+        /briefing (telegram_bot/handlers.py) can show it without a
+        schema change."""
+        payload = {"items": items, "reset_in": reset_in}
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO valorant_store (skins_json, checked_at) VALUES (?, ?)",
+                (json.dumps(payload, ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+            )
+
     # -- notifications (dedup, TZ v4 §20/§22) ----------------------------
 
     def was_notified(self, kind: str, dedupe_key: str) -> bool:
@@ -136,6 +155,7 @@ class Database:
         with self.connect() as conn:
             for table, column in (
                 ("weather_snapshots", "created_at"),
+                ("valorant_store", "checked_at"),
                 ("agent_runs", "finished_at"),
             ):
                 cur = conn.execute(f"DELETE FROM {table} WHERE {column} < ?", (cutoff,))
