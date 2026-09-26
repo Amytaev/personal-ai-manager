@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 
+from agents.teams.agent import WORK_API_URL, _EXPAND, _TOP, _filters
 from agents.teams.auth import TEAMS_URL, TeamsSession
 from config import load_config
 
@@ -135,51 +137,61 @@ async def main() -> None:
         await session.close()
         return
 
-    # The dashboard has several tabs (Предстоящие/Готово к оценке/
-    # Просрочено/Возвращено/Черновики per the screenshot you sent) - only
-    # the default one fires on load. Click through the student-relevant
-    # ones (skipping "Черновики"/Drafts, which is teacher-only content
-    # creation) to see whether each one fires its OWN /edu/me/work call
-    # with a different $filter, the way agents/teams/agent.py's original
-    # three-filter design assumed.
-    tab_labels = ["Предстоящие", "Просрочено", "Возвращено", "Готово к оценке"]
-    for tab_label in tab_labels:
-        try:
-            tab = page.get_by_role("tab", name=tab_label).first
-            await tab.wait_for(state="visible", timeout=3_000)
-        except Exception:
-            try:
-                tab = page.get_by_text(tab_label, exact=True).first
-                await tab.wait_for(state="visible", timeout=3_000)
-            except Exception as exc:  # noqa: BLE001 - just report and move on
-                print(f"\n  Could not find a clickable '{tab_label}' tab ({type(exc).__name__}) - skipping.")
-                continue
-        before_count = len(captured)
-        try:
-            print(f"\n  Clicking tab: {tab_label!r}")
-            await tab.click(timeout=5_000)
-            await page.wait_for_timeout(3_000)
-        except Exception as exc:  # noqa: BLE001 - report and move on to the next tab
-            print(f"    Click failed ({type(exc).__name__}) - skipping.")
-            continue
-        new_responses = captured[before_count:]
-        if not new_responses:
-            print(f"    No new matching response after clicking {tab_label!r}.")
+    # Simpler hypothesis than clicking through 5 fragile, localized UI
+    # tabs: the click that just worked completed a REAL Teams-SDK auth
+    # handshake for assignments.edu.cloud.microsoft (unlike our earlier
+    # standalone-navigation attempts, which never got that handshake at
+    # all and always 401'd). Maybe that's enough to make context.request
+    # (agent.py's own approach, with its own three known-good $filter
+    # queries) work now too - test that directly instead of guessing at
+    # tab selectors.
+    print("\nNow testing whether agent.py's OWN context.request.get() calls work, "
+          "now that a real click has completed the auth handshake once...")
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    direct_results = []
+    for filter_label, filter_expr in _filters(now_iso).items():
+        response = await context.request.get(
+            WORK_API_URL,
+            params={
+                "$filter": filter_expr,
+                "$top": str(_TOP),
+                "$orderby": "dueDateTime desc",
+                "$expand": _EXPAND,
+            },
+        )
+        items = None
+        if response.ok:
+            body = await response.json()
+            items = len(body.get("value", []))
+        direct_results.append((filter_label, response.status, items))
+        print(f"  direct context.request {filter_label!r} -> HTTP {response.status} "
+              f"{'items=' + str(items) if items is not None else ''}")
 
-    work_responses = [c for c in captured if "/edu/me/work" in c["url"]]
-    print(f"\nTotal /edu/me/work responses captured across all tabs: {len(work_responses)}")
-    for r in work_responses:
-        print(f"  {r['status']} items={r['items']}  {r['url'][:160]}")
-
-    statuses = {c["status"] for c in captured}
-    print(
-        f"\nVERDICT: a real UI click (+ tab clicks) triggered {len(work_responses)} "
-        f"/edu/me/work response(s), HTTP status(es) seen overall: {statuses}. "
-        "This is the real, verified way to get the data: drive the Assignments dashboard "
-        "click, then the tab clicks, and parse the response BODIES captured here directly - "
-        "no separate context.request call needed at all. agents/teams/agent.py should be "
-        "redesigned around this, using this same click sequence and response-capture pattern."
-    )
+    if all(status == 200 for _, status, _ in direct_results):
+        print(
+            "\nVERDICT: CONFIRMED - after one real UI click primes the session, agent.py's "
+            "OWN direct context.request.get() calls with its existing three $filter queries "
+            "work (all 200). The fix needed: _fetch_all_assignments() must click the "
+            "'Задания' button once (get_by_role('button', name='Задания')) before making "
+            "its existing API calls - no click-through-every-tab redesign needed, no "
+            "response-body-capture redesign needed, just one priming click first."
+        )
+    else:
+        work_responses = [c for c in captured if "/edu/me/work" in c["url"]]
+        print(f"\nTotal /edu/me/work responses captured from the page's OWN traffic: {len(work_responses)}")
+        for r in work_responses:
+            print(f"  {r['status']} items={r['items']}  {r['url'][:160]}")
+        print(
+            "\nVERDICT: priming with one click was NOT enough for agent.py's own direct calls "
+            "(see statuses above) - even though the page's OWN request worked. This means the "
+            "auth is tied to something click-scoped that context.request still can't reuse "
+            "(likely a token kept in the iframe's JS memory, not a cookie in the shared jar). "
+            "The real fix has to capture and reuse the response BODIES from the page's own "
+            "traffic (as this script already does for the default tab), which means finding "
+            "working tab-click selectors is still needed for full Overdue/Returned coverage - "
+            "report the exact tab element structure (e.g. via a screenshot with DevTools "
+            "Elements panel open on one tab) so the right selector can be pinned down."
+        )
 
     await session.close()
 
