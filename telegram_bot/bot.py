@@ -11,7 +11,7 @@ import logging
 
 from telegram import Update
 from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from config import AppConfig
 from storage.database import Database
@@ -51,10 +51,22 @@ class TelegramBot:
             "wishlist": self.handlers.wishlist_cmd,
             "addskin": self.handlers.addskin,
             "removeskin": self.handlers.removeskin,
-            "ask": self.handlers.ask,
         }
         for command, handler in bindings.items():
             self.app.add_handler(CommandHandler(command, auth(handler)))
+
+        # Any plain-text message that ISN'T a slash command goes straight
+        # to Claude (telegram_bot/handlers.py: Handlers.chat) - no /ask
+        # prefix needed. Slash commands above stay reserved for technical/
+        # debug actions. filters.COMMAND matches anything starting with
+        # "/" (including an unrecognized one like a mistyped "/wether"),
+        # so those are excluded here too and simply go unanswered rather
+        # than being treated as a chat question - a command typo staying
+        # silent is less surprising than it accidentally becoming a
+        # prompt to the LLM.
+        self.app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, auth(self.handlers.chat))
+        )
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         # TZ v4 §26: user-facing messages stay friendly/generic, the real

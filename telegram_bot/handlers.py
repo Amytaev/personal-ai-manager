@@ -50,8 +50,9 @@ class Handlers:
             "/wishlist - список желаемых скинов\n"
             "/addskin <название> - добавить в wishlist\n"
             "/removeskin <название> - убрать из wishlist\n"
-            "/ask <вопрос> - спросить у Claude (нужен LLM_API_KEY в .env)\n"
-            "/help - это сообщение"
+            "/help - это сообщение\n\n"
+            "Любое обычное сообщение (без /) отправляется напрямую Claude "
+            "(нужен LLM_API_KEY в .env)."
         )
 
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -170,18 +171,28 @@ class Handlers:
         else:
             await update.message.reply_text(f"{name} не найден в wishlist.")
 
-    async def ask(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Ad-hoc chat with the configured LLM (llm/provider.py).
 
-        This is separate from Phase 7's AI Manager summarization - that
-        will call the LLM automatically over the agents' own data. /ask
-        is a plain manual chat command: whatever the user types is sent
-        to the model as-is, nothing from the database is injected.
+        Handles any plain-text message that isn't a slash command - no
+        /ask prefix needed, per bro's Phase 5-adjacent review: slash
+        commands stay for technical/debug actions (/status, /tasks,
+        /weather, ...), plain conversation goes straight to Claude.
+
+        This is intentionally NOT yet the Phase 7 AI Manager: it does
+        not look anything up in the database or decide which agent's
+        data is relevant (there's barely any real agent data to look up
+        yet - Teams' parser/agent aren't written, VALORANT hasn't
+        started). It's a plain chat passthrough - whatever the user
+        typed goes to the model as-is, and if the user asks "what's up
+        today", the model answers as a generic assistant, honestly, not
+        pretending it has looked anything up. Real tool-calling routing
+        to get_tasks()/get_weather()/get_valorant() belongs in Phase 7,
+        once those are real data sources instead of empty tables.
         """
-        if not context.args:
-            await update.message.reply_text("Использование: /ask <вопрос>")
+        question = update.message.text
+        if not question or not question.strip():
             return
-        question = " ".join(context.args)
 
         provider = get_provider(self.config)
         if isinstance(provider, NullProvider):
@@ -194,7 +205,7 @@ class Handlers:
         try:
             answer = await provider.generate(question)
         except Exception:  # noqa: BLE001 - never let a provider/network error crash the bot
-            logger.exception("LLM provider failed while answering /ask")
+            logger.exception("LLM provider failed while answering a chat message")
             await update.message.reply_text(
                 "⚠️ Не удалось получить ответ от LLM. Подробности в логах."
             )

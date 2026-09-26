@@ -10,9 +10,10 @@ from storage.wishlist import WishlistStore
 from telegram_bot.handlers import Handlers
 
 
-def _fake_update_and_context(args: list[str] | None = None):
+def _fake_update_and_context(args: list[str] | None = None, text: str | None = None):
     update = MagicMock()
     update.message.reply_text = AsyncMock()
+    update.message.text = text
     context = MagicMock()
     context.args = args or []
     return update, context
@@ -133,44 +134,44 @@ async def test_addskin_without_args_shows_usage(handlers):
 
 
 @pytest.mark.asyncio
-async def test_ask_without_args_shows_usage(handlers):
-    update, context = _fake_update_and_context(args=[])
-    await handlers.ask(update, context)
+async def test_chat_ignores_empty_or_whitespace_only_text(handlers):
+    update, context = _fake_update_and_context(text="   ")
+    await handlers.chat(update, context)
 
-    assert "Использование" in update.message.reply_text.call_args.args[0]
+    update.message.reply_text.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_ask_without_llm_configured_tells_user_to_set_key(handlers):
-    update, context = _fake_update_and_context(args=["What", "is", "2+2?"])
+async def test_chat_without_llm_configured_tells_user_to_set_key(handlers):
+    update, context = _fake_update_and_context(text="What is 2+2?")
     with patch("telegram_bot.handlers.get_provider", return_value=NullProvider()):
-        await handlers.ask(update, context)
+        await handlers.chat(update, context)
 
     text = update.message.reply_text.call_args.args[0]
     assert "LLM_API_KEY" in text
 
 
 @pytest.mark.asyncio
-async def test_ask_returns_the_provider_answer(handlers):
+async def test_chat_returns_the_provider_answer(handlers):
     fake_provider = MagicMock()
     fake_provider.generate = AsyncMock(return_value="4")
-    update, context = _fake_update_and_context(args=["What", "is", "2+2?"])
+    update, context = _fake_update_and_context(text="What is 2+2?")
 
     with patch("telegram_bot.handlers.get_provider", return_value=fake_provider):
-        await handlers.ask(update, context)
+        await handlers.chat(update, context)
 
     fake_provider.generate.assert_awaited_once_with("What is 2+2?")
     assert update.message.reply_text.call_args.args[0] == "4"
 
 
 @pytest.mark.asyncio
-async def test_ask_reports_a_friendly_error_when_the_provider_fails(handlers):
+async def test_chat_reports_a_friendly_error_when_the_provider_fails(handlers):
     fake_provider = MagicMock()
     fake_provider.generate = AsyncMock(side_effect=RuntimeError("boom"))
-    update, context = _fake_update_and_context(args=["hi"])
+    update, context = _fake_update_and_context(text="hi")
 
     with patch("telegram_bot.handlers.get_provider", return_value=fake_provider):
-        await handlers.ask(update, context)
+        await handlers.chat(update, context)
 
     text = update.message.reply_text.call_args.args[0]
     assert "не удалось" in text.lower()
