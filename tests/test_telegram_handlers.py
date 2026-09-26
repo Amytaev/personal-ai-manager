@@ -121,6 +121,12 @@ async def test_store_sends_media_group_with_captions_and_reset_time(handlers, tm
 
     update.message.reply_photo.assert_not_awaited()
     tail_text = update.message.reply_text.call_args.args[0]
+    # Real live /store showed Telegram's media-group view rendering NO
+    # per-photo captions at all (a real Telegram client limitation, not a
+    # bug here) - so the name/price text must always be repeated in this
+    # follow-up message too, not just set on the photos themselves.
+    assert "Апертура — 1275 VP" in tail_text
+    assert "Куронами — 2375 VP" in tail_text
     assert "7 часов и 49 минут" in tail_text
 
 
@@ -157,7 +163,12 @@ async def test_store_lists_items_missing_an_image_as_text(handlers, tmp_db):
 
     update.message.reply_media_group.assert_awaited_once()
     tail_text = update.message.reply_text.call_args.args[0]
-    assert "БезКартинки" in tail_text and "500 VP" in tail_text
+    # The full list is always sent, not just the items missing a photo -
+    # and the one missing an image is flagged so it's clear why it has no
+    # picture above it.
+    assert "Апертура — 1275 VP" in tail_text
+    assert "Куронами — 2375 VP" in tail_text
+    assert "БезКартинки — 500 VP (без фото)" in tail_text
 
 
 @pytest.mark.asyncio

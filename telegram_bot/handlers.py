@@ -67,6 +67,15 @@ def _item_caption(item: dict) -> str:
     return f"{item.get('name', '?')} — {_price_text(item)}"
 
 
+def _item_line(item: dict) -> str:
+    """Same as _item_caption, but flags an item that has no image_url -
+    used only in the always-sent text listing (see store() below), so a
+    reader can tell why that one skin has no photo above it without
+    losing the name/price line entirely."""
+    caption = _item_caption(item)
+    return caption if item.get("image_url") else f"{caption} (без фото)"
+
+
 def _format_store_text(skins_json: str, checked_at: str) -> str:
     """Text-only rendering of the store - used when the payload can't be
     parsed at all, or as a fallback when sending photos itself fails
@@ -77,7 +86,7 @@ def _format_store_text(skins_json: str, checked_at: str) -> str:
 
     items, reset_in = parsed
     lines = [f"\U0001f3ae Магазин VALORANT (обновлено {checked_at}):"]
-    lines.extend(f"• {_item_caption(item)}" for item in items)
+    lines.extend(f"• {_item_line(item)}" for item in items)
     if reset_in:
         lines.append(f"\n⏳ Сброс через: {reset_in}")
     return "\n".join(lines)
@@ -206,7 +215,6 @@ class Handlers:
             )
 
         with_images = [item for item in items if item.get("image_url")]
-        without_images = [item for item in items if not item.get("image_url")]
 
         try:
             if len(with_images) >= 2:
@@ -223,14 +231,20 @@ class Handlers:
             await update.message.reply_text(_format_store_text(row["skins_json"], row["checked_at"]))
             return
 
-        tail_lines = []
-        if without_images:
-            tail_lines.append("Без картинки:")
-            tail_lines.extend(f"• {_item_caption(item)}" for item in without_images)
+        # Telegram's own clients only ever surface ONE caption (or none at
+        # all) in a media group's compact feed view - a real album sent
+        # live showed every per-photo caption above simply invisible, even
+        # though they were set correctly (Telegram's real, documented album
+        # UI limitation, not a bug on our side). So the name/price text is
+        # NEVER left to those per-photo captions alone: this always-sent
+        # follow-up message repeats every item's name and price as plain
+        # text, guaranteed visible regardless of how any given Telegram
+        # client chooses to render the album above it.
+        tail_lines = [f"\U0001f3ae Магазин VALORANT (обновлено {row['checked_at']}):"]
+        tail_lines.extend(f"• {_item_line(item)}" for item in items)
         if reset_in:
             tail_lines.append(f"\n⏳ Сброс через: {reset_in}")
-        if tail_lines:
-            await update.message.reply_text("\n".join(tail_lines))
+        await update.message.reply_text("\n".join(tail_lines))
 
     async def briefing(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         with self.db.connect() as conn:
