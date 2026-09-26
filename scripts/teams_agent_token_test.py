@@ -60,15 +60,27 @@ async def main() -> None:
     page = await context.new_page()
 
     captured_auth_header: str | None = None
+    captured_from_url: str | None = None
+    # Broader than just WORK_API_URL - same "cast a wide net, skim after"
+    # approach as teams_capture_assignments.py's INTERESTING_SUBSTRINGS,
+    # in case the class-scoped list page calls a DIFFERENT endpoint than
+    # the /edu/me/work dashboard endpoint the three captured $filter
+    # queries came from.
+    interesting_substrings = ("assignment", "edu.cloud.microsoft", "class", "work")
+    seen_requests: list[str] = []
 
     def _on_request(request) -> None:
-        nonlocal captured_auth_header
+        nonlocal captured_auth_header, captured_from_url
+        lowered = request.url.lower()
+        if any(s in lowered for s in interesting_substrings):
+            seen_requests.append(f"{request.method} {request.url}")
         if captured_auth_header is not None:
             return
         if request.url.startswith(WORK_API_URL):
             header = request.headers.get("authorization")
             if header:
                 captured_auth_header = header
+                captured_from_url = request.url
                 print("  -> captured an Authorization header on the page's own work-API request "
                       "(value withheld - see this script's security note)")
 
@@ -80,20 +92,30 @@ async def main() -> None:
             wait_until="networkidle",
             timeout=30_000,
         )
+        print(f"  Landed on: {page.url}")
+        print(f"  Page title: {await page.title()!r}")
         # Give the page's own JS a little extra time to fire its data
         # fetch in case networkidle settled just before it, since we
         # only care about the work-API request specifically.
-        await page.wait_for_timeout(3_000)
+        await page.wait_for_timeout(5_000)
     finally:
         await page.close()
 
     if captured_auth_header is None:
+        print(f"\nAll {interesting_substrings!r}-matching requests seen during this run:")
+        if seen_requests:
+            for req in seen_requests:
+                print(f"  {req}")
+        else:
+            print("  (none at all)")
         print(
-            "\nVERDICT: the class page loaded, but no request to the work API "
-            f"({WORK_API_URL}) was observed at all within the wait window. "
-            "Either this page doesn't call that exact endpoint, or it needs more "
-            "time / a different classId. Report this back - a different diagnostic "
-            "approach (checking sessionStorage/localStorage directly) would be next."
+            f"\nVERDICT: the class page loaded, but no request to the exact work API "
+            f"({WORK_API_URL}) was observed within the wait window. See the list above - "
+            "if it's empty, we likely landed on a login/consent page instead of the real "
+            "class list (check 'Landed on'/'Page title' above); if it has entries, the "
+            "class-scoped page calls a DIFFERENT endpoint than the /edu/me/work dashboard "
+            "endpoint - report the URLs above (they're not secrets, just endpoint paths) "
+            "so agent.py can be pointed at the right one."
         )
         await session.close()
         return
