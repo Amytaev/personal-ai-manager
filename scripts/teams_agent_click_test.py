@@ -182,16 +182,33 @@ async def main() -> None:
         for r in work_responses:
             print(f"  {r['status']} items={r['items']}  {r['url'][:160]}")
         print(
-            "\nVERDICT: priming with one click was NOT enough for agent.py's own direct calls "
-            "(see statuses above) - even though the page's OWN request worked. This means the "
-            "auth is tied to something click-scoped that context.request still can't reuse "
-            "(likely a token kept in the iframe's JS memory, not a cookie in the shared jar). "
-            "The real fix has to capture and reuse the response BODIES from the page's own "
-            "traffic (as this script already does for the default tab), which means finding "
-            "working tab-click selectors is still needed for full Overdue/Returned coverage - "
-            "report the exact tab element structure (e.g. via a screenshot with DevTools "
-            "Elements panel open on one tab) so the right selector can be pinned down."
+            "\nConfirmed: auth is scoped to the iframe itself (a token in JS memory), not "
+            "reusable via context.request. Real fix has to capture response BODIES from the "
+            "page's own traffic for each tab - dumping the real DOM structure of the "
+            "Assignments iframe instead of guessing selectors any further:"
         )
+
+        assignments_frame = next(
+            (f for f in page.frames if "assignments.edu.cloud.microsoft" in f.url), None
+        )
+        if assignments_frame is None:
+            print("  Could not find the assignments.edu.cloud.microsoft frame anymore - skipping DOM dump.")
+        else:
+            elements = await assignments_frame.evaluate(
+                """
+                () => {
+                    const els = Array.from(document.querySelectorAll('[role]'));
+                    return els.slice(0, 60).map(el => ({
+                        role: el.getAttribute('role'),
+                        name: (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 60),
+                        tag: el.tagName.toLowerCase(),
+                    })).filter(e => e.name);
+                }
+                """
+            )
+            print(f"\n  {len(elements)} labeled [role] element(s) found inside the Assignments iframe:")
+            for el in elements:
+                print(f"    <{el['tag']} role={el['role']!r}> {el['name']!r}")
 
     await session.close()
 
