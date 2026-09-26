@@ -75,6 +75,11 @@ class _Env:
         self.page.goto = AsyncMock()
         self.page.close = AsyncMock()
         self.page.on = MagicMock(side_effect=self._capture_handler)
+        # Failure-diagnostics capture (screenshot + visible text) - default
+        # to succeeding harmlessly; a dedicated test below simulates it
+        # failing to prove that never masks the real error.
+        self.page.screenshot = AsyncMock()
+        self.page.inner_text = AsyncMock(return_value="Sign in to your account")
         # Mirrors TeamsSession.is_logged_in()'s tolerance for a top-level
         # MSAL silent-refresh redirect round trip after goto() - defaults to
         # "resolves immediately" (already on the logged-in URL); tests that
@@ -226,6 +231,29 @@ async def test_run_reports_needs_reauth_when_button_timeout_and_url_shows_logged
     assert result.status == AgentStatus.FAILING
     assert result.data["needs_reauth"] is True
     assert "NeedsReauth" in result.error or "expired" in result.error.lower()
+    # Diagnostic capture (2026-09-26 fix): a screenshot and a page-text
+    # snippet should be captured so a live failure leaves real evidence
+    # behind, not just a URL string.
+    env.page.screenshot.assert_awaited_once()
+    env.page.inner_text.assert_awaited_once_with("body")
+
+
+@pytest.mark.asyncio
+async def test_run_still_reports_needs_reauth_when_the_diagnostics_capture_itself_fails(tmp_db):
+    # The screenshot/text capture is best-effort - if IT fails (disk full,
+    # page already navigating again, whatever), that must never mask the
+    # real NeedsReauth error being reported.
+    env = _Env(
+        page_url="https://login.microsoftonline.com/some-tenant/saml2",
+        button_wait_error=TimeoutError("Timeout 15000ms exceeded"),
+    )
+    env.page.screenshot = AsyncMock(side_effect=RuntimeError("disk full"))
+    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
+
+    result = await agent.run()
+
+    assert result.status == AgentStatus.FAILING
+    assert result.data["needs_reauth"] is True
 
 
 @pytest.mark.asyncio

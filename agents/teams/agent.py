@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 from agents.base import AgentResult, AgentStatus, BaseAgent
 from agents.teams.auth import LOGGED_IN_URL_HINT, TEAMS_URL, TeamsSession
@@ -54,6 +55,34 @@ from agents.teams.parser import parse_due, parse_work_response
 from storage.database import Database
 
 logger = logging.getLogger(__name__)
+
+# Where the "the button never showed up" diagnostic capture below saves a
+# screenshot - overwritten on every occurrence (only the most recent
+# failure matters), so a live run that hits this leaves behind real
+# evidence to look at instead of just a URL string in the log.
+_FAILURE_SCREENSHOT_PATH = Path("data/teams_last_failure.png")
+
+
+async def _capture_failure_diagnostics(page) -> None:
+    """Best-effort screenshot + visible-text snippet of the page at the
+    moment NeedsReauth/a UI-change failure is about to be raised (2026-09-26:
+    a timing-based fix for this exact failure turned out NOT to be enough
+    live, so the next occurrence needs to leave real evidence behind -
+    what the page actually looked like - rather than another guess).
+    Deliberately never raises: a diagnostics failure must never mask the
+    real error being reported by the caller."""
+    try:
+        _FAILURE_SCREENSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        await page.screenshot(path=str(_FAILURE_SCREENSHOT_PATH))
+        text = await page.inner_text("body")
+        snippet = " ".join(text.split())[:500]
+        logger.warning(
+            "Teams agent: saved failure screenshot to %s. Visible page text "
+            "(first 500 chars): %s",
+            _FAILURE_SCREENSHOT_PATH, snippet,
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the real failure
+        logger.warning("Teams agent: could not capture failure diagnostics", exc_info=True)
 
 
 class NeedsReauth(RuntimeError):
@@ -242,12 +271,15 @@ class TeamsAgent(BaseAgent):
                 # genuinely stale session), or the URL matches and the
                 # button itself just isn't there (a real UI change,
                 # unrelated to auth).
+                await _capture_failure_diagnostics(page)
                 if LOGGED_IN_URL_HINT not in page.url:
                     raise NeedsReauth(
                         f"Teams session looks expired - after opening {TEAMS_URL} the page "
                         f"ended up at {page.url!r} (expected a URL containing "
                         f"{LOGGED_IN_URL_HINT!r}) and the \"{_ASSIGNMENTS_BUTTON_NAME}\" button "
-                        "never appeared. Run scripts/teams_login_setup.py to log back in."
+                        "never appeared. Run scripts/teams_login_setup.py to log back in. "
+                        f"A screenshot of what the page actually looked like was saved to "
+                        f"{_FAILURE_SCREENSHOT_PATH} - check the logs above for a text snippet too."
                     ) from exc
                 raise RuntimeError(
                     f"Session looks logged in (URL {page.url!r} matched "
