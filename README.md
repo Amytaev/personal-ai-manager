@@ -313,6 +313,64 @@ TimeoutError: Locator.wait_for: Timeout 15000ms exceeded.
 (дедуплицируется через `notifications`, как и раньше). Фильтр
 `TEAMS_MIN_DUE_DATE` не тронут.
 
+### Второй живой прогон: `NeedsReauth` детектировался правильно, но сессия была на самом деле рабочая
+
+Первое исправление (выше) верно классифицировало таймаут и правильно
+прислало уведомление в Telegram — но не решило проблему целиком.
+Следующий живой прогон показал: `python -m scripts.teams_login_setup`
+отработал чисто (`Login detected as successful`, `Headless re-check:
+OK, still logged in`), а сразу за ним `python run.py` **снова** упал с
+`NeedsReauth`, с `page.url`, реально указывающим на
+`login.microsoftonline.com/common/oauth2/v2.0/authorize?...&response_type=code&code_challenge=...` —
+это MSAL.js (`x-client-SKU=msal.js.browser` виден прямо в URL),
+Teams-овский OAuth2/PKCE редирект.
+
+Разбор двух путей кода, которые используют один и тот же
+persistent-профиль, показал реальную асимметрию:
+
+- `TeamsSession.is_logged_in()` (используется и в `teams_login_setup.py`,
+  и был бы правильным эталоном) после `page.goto(..., "domcontentloaded")`
+  ещё явно ждёт `page.wait_for_url(f"**{LOGGED_IN_URL_HINT}**", timeout=15000)`
+  — то есть **даёт странице до 15 секунд домотать редирект туда-обратно**
+  через `login.microsoftonline.com`, если MSAL решил молча обновить
+  access-токен;
+- `TeamsAgent._fetch_all_assignments()` — нет: раньше он делал
+  `page.goto(..., "networkidle")` и сразу шёл проверять кнопку
+  "Задания", ни разу не дав странице шанс доехать обратно на
+  `teams.microsoft.com/v2/`, если в этот момент шёл именно такой
+  редирект. `goto()` вполне может резолвиться, пока страница ещё
+  физически стоит на `login.microsoftonline.com` (та тоже успевает
+  дойти до networkidle) — и код в следующей же строке читает `page.url`,
+  видит домен логина и (справедливо, по своей логике) объявляет сессию
+  протухшей, хотя сессия на самом деле живая и просто ещё не
+  доредиректилась.
+
+Это объясняет всё сразу: почему `is_logged_in()` в самом
+`teams_login_setup.py` — тем же профилем, тем же headless-запуском —
+проходит секундами раньше, чем `run.py` падает; и почему повторный
+запуск `teams_login_setup.py` ничего не чинит (с профилем и правда всё
+в порядке, ловится не протухшая сессия, а гонка в самом агенте).
+
+**Исправление** (`agents/teams/agent.py`): `_fetch_all_assignments()`
+теперь после `goto()` (переключен на `"domcontentloaded"`, как в
+`is_logged_in()`) точно так же явно ждёт
+`page.wait_for_url(f"**{LOGGED_IN_URL_HINT}**", timeout=20000)` — тем же
+проверенным паттерном — прежде чем вообще смотреть на кнопку или на
+`page.url`. Если это ожидание само по себе таймаутится — не фатально,
+это просто сигнал "не успело", решение всё равно принимает проверка
+кнопки/URL сразу следом (не изменилась). Архитектура авторизации не
+тронута — тот же persistent-профиль, тот же ручной вход, никакого
+автоввода пароля.
+
+**Честно**: живого доступа к настоящему Teams-тенанту у меня нет (эта
+работа идёт в песочнице без сети до `teams.microsoft.com`), так что
+это исправление основано на реальных данных из твоих логов и
+проверенном коде `is_logged_in()`, а не подтверждено живым прогоном с
+моей стороны — нужно `git pull` и ещё раз `python run.py`, без
+повторного ручного логина (профиль не трогали). Если всё-таки
+повторится — пришли лог, `page.url` в сообщении об ошибке в этот раз
+покажет, реально ли редирект не успел доехать или это другая причина.
+
 ### `/store` теперь с картинками скинов (Phase 6.3, п.2-3)
 
 Stack B уже отдаёт `image_url` на каждый предмет
@@ -381,13 +439,14 @@ tool-calling роутер. На "Что там на сегодня?" Claude от
 
 ## Тесты
 
-**123 теста, все проходят**: 56 из Phase 2-4 (core infra, БД,
+**125 тестов, все проходят**: 56 из Phase 2-4 (core infra, БД,
 scheduler/retry, Weather Agent, Telegram auth/wishlist, LLM provider —
-включая 4 для чата с Claude, `Handlers.chat`) + 39 из Phase 5 (18 для
-Teams-парсера, 7 для `TeamsSession`, 14 для `TeamsAgent`, включая 3
-новых на `NeedsReauth` из Phase 6.3 — см. ниже) + 20 для VALORANT (Phase
-6) + 8 новых в `test_telegram_handlers.py` для `/store` с картинками
-(Phase 6.3).
+включая 4 для чата с Claude, `Handlers.chat`) + 41 из Phase 5 (18 для
+Teams-парсера, 7 для `TeamsSession`, 16 для `TeamsAgent`, включая 3 на
+`NeedsReauth`-классификацию и 2 на ожидание редиректа
+(`wait_for_url`) из второго раунда Phase 6.3 — см. выше) + 20 для
+VALORANT (Phase 6) + 8 в `test_telegram_handlers.py` для `/store` с
+картинками (Phase 6.3).
 
 - `tests/test_teams_parser.py` (18 тестов) — чистые функции
   `resolve_course_name`/`compute_status`/`parse_assignment`/

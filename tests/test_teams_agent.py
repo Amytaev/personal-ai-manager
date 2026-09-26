@@ -64,6 +64,7 @@ class _Env:
         failing_tab_indexes: tuple[int, ...] = (),
         page_url: str = "https://teams.microsoft.com/v2/some-team",
         button_wait_error: Exception | None = None,
+        wait_for_url_error: Exception | None = None,
     ):
         self.tab_bodies = tab_bodies or {}
         self.failing_tab_indexes = failing_tab_indexes
@@ -74,6 +75,14 @@ class _Env:
         self.page.goto = AsyncMock()
         self.page.close = AsyncMock()
         self.page.on = MagicMock(side_effect=self._capture_handler)
+        # Mirrors TeamsSession.is_logged_in()'s tolerance for a top-level
+        # MSAL silent-refresh redirect round trip after goto() - defaults to
+        # "resolves immediately" (already on the logged-in URL); tests that
+        # care pass wait_for_url_error to simulate it timing out instead.
+        if wait_for_url_error is not None:
+            self.page.wait_for_url = AsyncMock(side_effect=wait_for_url_error)
+        else:
+            self.page.wait_for_url = AsyncMock()
 
         button_locator = MagicMock()
         if button_wait_error is not None:
@@ -234,6 +243,40 @@ async def test_run_reports_plain_failure_when_button_timeout_but_url_still_looks
     assert result.status == AgentStatus.FAILING
     assert result.data.get("needs_reauth") is not True
     assert "UI may have changed" in result.error
+
+
+@pytest.mark.asyncio
+async def test_run_waits_for_redirect_round_trip_to_settle_before_checking_the_button(tmp_db):
+    # Real fix (2026-09-26): a still-valid session can bounce through a
+    # top-level MSAL refresh redirect after goto() - this must be given a
+    # chance to land back on LOGGED_IN_URL_HINT before the button/url check
+    # runs, exactly like TeamsSession.is_logged_in() already does.
+    env = _Env(tab_bodies={0: {"value": [_assignment("a1", "e3f75118-bae6-4636-87c7-b2e91b63f913")]}})
+    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
+
+    result = await agent.run()
+
+    env.page.wait_for_url.assert_awaited_once()
+    (pattern,), _ = env.page.wait_for_url.call_args
+    assert "teams.microsoft.com/v2/" in pattern
+    assert result.status == AgentStatus.WORKING
+
+
+@pytest.mark.asyncio
+async def test_run_still_succeeds_when_the_wait_for_url_call_itself_times_out_but_url_recovers(tmp_db):
+    # wait_for_url() timing out isn't fatal by itself - it's only a hint;
+    # the button-visibility check right after is what actually decides
+    # success/failure, so if the button is there anyway (e.g. the redirect
+    # resolved a beat after the 20s window), the run should still work.
+    env = _Env(
+        tab_bodies={0: {"value": [_assignment("a1", "e3f75118-bae6-4636-87c7-b2e91b63f913")]}},
+        wait_for_url_error=TimeoutError("Timeout 20000ms exceeded"),
+    )
+    agent = TeamsAgent(profile_dir="unused", db=tmp_db, session=env.session)
+
+    result = await agent.run()
+
+    assert result.status == AgentStatus.WORKING
 
 
 @pytest.mark.asyncio

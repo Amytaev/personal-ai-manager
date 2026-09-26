@@ -203,24 +203,45 @@ class TeamsAgent(BaseAgent):
         page.on("response", lambda r: asyncio.create_task(_on_response(r)))
 
         try:
-            await page.goto(TEAMS_URL, wait_until="networkidle", timeout=30_000)
+            await page.goto(TEAMS_URL, wait_until="domcontentloaded", timeout=30_000)
+
+            # Real failure seen live (2026-09-26, twice, immediately after a
+            # confirmed-successful scripts/teams_login_setup.py run whose own
+            # headless is_logged_in() re-check passed): a fresh, still-valid
+            # session can still bounce through a full top-level redirect to
+            # login.microsoftonline.com/.../authorize (Teams' MSAL client
+            # silently refreshing its access token) before landing back on
+            # teams.microsoft.com/v2/. TeamsSession.is_logged_in() already
+            # tolerates this round trip with its own page.wait_for_url() call
+            # - this method didn't: it used to go straight from goto() (which
+            # can resolve mid-redirect, while page.url is still the
+            # login.microsoftonline.com address) into the button check below,
+            # so it was reading page.url before the redirect had a chance to
+            # finish and mis-diagnosing an in-flight refresh as a dead
+            # session. Give it the same chance to settle here, using the
+            # exact tested pattern from is_logged_in() - if the session
+            # really is dead this will simply time out and page.url will
+            # still show the login domain, which the check below already
+            # handles correctly.
+            try:
+                await page.wait_for_url(f"**{LOGGED_IN_URL_HINT}**", timeout=20_000)
+            except Exception:  # noqa: BLE001 - Playwright's own TimeoutError; handled below
+                pass
 
             assignments_button = page.get_by_role("button", name=_ASSIGNMENTS_BUTTON_NAME).first
             try:
                 await assignments_button.wait_for(state="visible", timeout=15_000)
             except Exception as exc:  # noqa: BLE001 - Playwright's own TimeoutError
-                # Real failure seen live (2026-09-26 smoke test): this
-                # wait_for() is exactly where the agent timed out. Two
-                # different real causes produce the identical
+                # Two different real causes produce the identical
                 # TimeoutError here, so page.url - the same signal
                 # TeamsSession.is_logged_in() already uses - decides
                 # which one actually happened, instead of guessing:
                 # either Teams itself navigated away from
-                # LOGGED_IN_URL_HINT (a stale/expired session - the
-                # button was never going to appear because we're not
-                # looking at a logged-in Teams page at all), or the URL
-                # still looks right and the button itself just isn't
-                # there (a real UI change, unrelated to auth).
+                # LOGGED_IN_URL_HINT and STAYED away even after the
+                # wait_for_url() above gave it 20s to bounce back (a
+                # genuinely stale session), or the URL matches and the
+                # button itself just isn't there (a real UI change,
+                # unrelated to auth).
                 if LOGGED_IN_URL_HINT not in page.url:
                     raise NeedsReauth(
                         f"Teams session looks expired - after opening {TEAMS_URL} the page "
