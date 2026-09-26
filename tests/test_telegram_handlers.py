@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from llm.provider import NullProvider
 from storage.wishlist import WishlistStore
 from telegram_bot.handlers import Handlers
 
@@ -129,3 +130,48 @@ async def test_addskin_without_args_shows_usage(handlers):
     await handlers.addskin(update, context)
 
     assert "Использование" in update.message.reply_text.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_ask_without_args_shows_usage(handlers):
+    update, context = _fake_update_and_context(args=[])
+    await handlers.ask(update, context)
+
+    assert "Использование" in update.message.reply_text.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_ask_without_llm_configured_tells_user_to_set_key(handlers):
+    update, context = _fake_update_and_context(args=["What", "is", "2+2?"])
+    with patch("telegram_bot.handlers.get_provider", return_value=NullProvider()):
+        await handlers.ask(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "LLM_API_KEY" in text
+
+
+@pytest.mark.asyncio
+async def test_ask_returns_the_provider_answer(handlers):
+    fake_provider = MagicMock()
+    fake_provider.generate = AsyncMock(return_value="4")
+    update, context = _fake_update_and_context(args=["What", "is", "2+2?"])
+
+    with patch("telegram_bot.handlers.get_provider", return_value=fake_provider):
+        await handlers.ask(update, context)
+
+    fake_provider.generate.assert_awaited_once_with("What is 2+2?")
+    assert update.message.reply_text.call_args.args[0] == "4"
+
+
+@pytest.mark.asyncio
+async def test_ask_reports_a_friendly_error_when_the_provider_fails(handlers):
+    fake_provider = MagicMock()
+    fake_provider.generate = AsyncMock(side_effect=RuntimeError("boom"))
+    update, context = _fake_update_and_context(args=["hi"])
+
+    with patch("telegram_bot.handlers.get_provider", return_value=fake_provider):
+        await handlers.ask(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "не удалось" in text.lower()
+    assert "boom" not in text

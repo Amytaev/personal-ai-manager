@@ -14,6 +14,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from config import AppConfig
+from llm.provider import NullProvider, get_provider
 from storage.database import Database
 from storage.wishlist import WishlistStore
 
@@ -49,6 +50,7 @@ class Handlers:
             "/wishlist - список желаемых скинов\n"
             "/addskin <название> - добавить в wishlist\n"
             "/removeskin <название> - убрать из wishlist\n"
+            "/ask <вопрос> - спросить у Claude (нужен LLM_API_KEY в .env)\n"
             "/help - это сообщение"
         )
 
@@ -167,3 +169,35 @@ class Handlers:
             await update.message.reply_text(f"\U0001f5d1 {name} удалён из wishlist.")
         else:
             await update.message.reply_text(f"{name} не найден в wishlist.")
+
+    async def ask(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Ad-hoc chat with the configured LLM (llm/provider.py).
+
+        This is separate from Phase 7's AI Manager summarization - that
+        will call the LLM automatically over the agents' own data. /ask
+        is a plain manual chat command: whatever the user types is sent
+        to the model as-is, nothing from the database is injected.
+        """
+        if not context.args:
+            await update.message.reply_text("Использование: /ask <вопрос>")
+            return
+        question = " ".join(context.args)
+
+        provider = get_provider(self.config)
+        if isinstance(provider, NullProvider):
+            await update.message.reply_text(
+                "⚠️ LLM не настроен. Добавь LLM_API_KEY (и, при желании, "
+                "LLM_MODEL) в .env — см. .env.example — и перезапусти приложение."
+            )
+            return
+
+        try:
+            answer = await provider.generate(question)
+        except Exception:  # noqa: BLE001 - never let a provider/network error crash the bot
+            logger.exception("LLM provider failed while answering /ask")
+            await update.message.reply_text(
+                "⚠️ Не удалось получить ответ от LLM. Подробности в логах."
+            )
+            return
+
+        await update.message.reply_text(answer)

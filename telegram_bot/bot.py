@@ -51,6 +51,7 @@ class TelegramBot:
             "wishlist": self.handlers.wishlist_cmd,
             "addskin": self.handlers.addskin,
             "removeskin": self.handlers.removeskin,
+            "ask": self.handlers.ask,
         }
         for command, handler in bindings.items():
             self.app.add_handler(CommandHandler(command, auth(handler)))
