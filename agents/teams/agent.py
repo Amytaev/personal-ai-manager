@@ -229,8 +229,23 @@ class TeamsAgent(BaseAgent):
             if isinstance(body, dict) and isinstance(body.get("value"), list):
                 captured_bodies.append(body)
 
-        page.on("response", lambda r: asyncio.create_task(_on_response(r)))
-
+        # NOTE: this listener used to be registered here, before goto() -
+        # moved below (right before the button click) as of 2026-09-26.
+        # Real live testing that day showed a diagnostic script doing the
+        # exact same goto()+wait_for_url() as below, on the exact same
+        # profile, seconds apart, succeeding every time - the ONLY
+        # remaining difference from this method was this listener (which
+        # spawns an asyncio task, via response.json(), for literally every
+        # single resource the login/SPA page loads while it's deciding
+        # whether to silently refresh Teams' access token). That's a real,
+        # concrete difference between "worked" and "didn't" runs, even if
+        # the exact mechanism (event-loop contention delaying whatever
+        # timing-sensitive check MSAL's own JS does during that silent
+        # refresh) isn't independently confirmed - nothing captured by
+        # this listener is needed before the "Задания" button exists
+        # anyway (the work API never fires before that click), so there's
+        # no downside to only turning it on once we're past the point
+        # where auth is being decided.
         try:
             await page.goto(TEAMS_URL, wait_until="domcontentloaded", timeout=30_000)
 
@@ -286,6 +301,12 @@ class TeamsAgent(BaseAgent):
                     f"{LOGGED_IN_URL_HINT!r}) but the \"{_ASSIGNMENTS_BUTTON_NAME}\" button "
                     "never became visible within 15000ms - Teams' UI may have changed."
                 ) from exc
+
+            # Only now (see this method's docstring/comment above) does the
+            # response listener actually get turned on - the button exists,
+            # auth is settled, and every work-API call we care about
+            # happens from this click onward.
+            page.on("response", lambda r: asyncio.create_task(_on_response(r)))
             await assignments_button.click(timeout=5_000)
 
             # The default ("Предстоящие"/Upcoming) tab fires its own
