@@ -159,3 +159,68 @@ async def test_missing_precipitation_field_does_not_crash():
 
     assert result.status == AgentStatus.WORKING
     assert result.data["forecast"][0]["precipitation_probability"] is None
+
+
+@pytest.mark.asyncio
+async def test_mismatched_daily_array_lengths_truncates_instead_of_crashing():
+    # A real API misbehaving: `time` promises 3 days but temperature_2m_max
+    # only has 2 entries. Must not raise IndexError - either truncate
+    # cleanly or report FAILING, never crash run_isolated()'s caller.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "geocoding-api" in str(request.url):
+            return _geocoding_response(request)
+        return httpx.Response(
+            200,
+            json={
+                "current": {
+                    "temperature_2m": 10,
+                    "apparent_temperature": 9,
+                    "weather_code": 0,
+                    "wind_speed_10m": 2,
+                },
+                "daily": {
+                    "time": ["2026-09-26", "2026-09-27", "2026-09-28"],
+                    "temperature_2m_max": [12, 13],  # short by one
+                    "temperature_2m_min": [5, 6, 7],
+                    "precipitation_probability_max": [10, 20, 30],
+                    "weather_code": [0, 1, 2],
+                },
+            },
+        )
+
+    agent = WeatherAgent("Almaty", http_client=_client_for(handler))
+    result = await agent.run()
+    await agent.aclose()
+
+    assert result.status == AgentStatus.WORKING
+    assert len(result.data["forecast"]) == 2  # truncated to the shortest array
+
+
+@pytest.mark.asyncio
+async def test_missing_required_daily_field_reports_failing_not_crash():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "geocoding-api" in str(request.url):
+            return _geocoding_response(request)
+        return httpx.Response(
+            200,
+            json={
+                "current": {
+                    "temperature_2m": 10,
+                    "apparent_temperature": 9,
+                    "weather_code": 0,
+                    "wind_speed_10m": 2,
+                },
+                "daily": {
+                    "time": ["2026-09-26"],
+                    "temperature_2m_max": [12],
+                    # temperature_2m_min and weather_code entirely absent
+                },
+            },
+        )
+
+    agent = WeatherAgent("Almaty", http_client=_client_for(handler))
+    result = await agent.run()
+    await agent.aclose()
+
+    assert result.status == AgentStatus.FAILING
+    assert "Unexpected Open-Meteo response shape" in result.error

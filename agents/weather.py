@@ -138,6 +138,38 @@ class WeatherAgent(BaseAgent):
         days = daily.get("time", [])
         precipitation = daily.get("precipitation_probability_max", [None] * len(days))
 
+        try:
+            # Don't assume Open-Meteo's daily arrays are all the same
+            # length as `time` - if the API ever returns a short/missing
+            # array, iterate only as far as every field we index actually
+            # has data, rather than risking an IndexError/KeyError deep
+            # inside a list comprehension (caught here explicitly so the
+            # error message says *what* was inconsistent, rather than
+            # relying on run_isolated()'s generic backstop to catch it).
+            required_lengths = [
+                len(days),
+                len(daily["temperature_2m_max"]),
+                len(daily["temperature_2m_min"]),
+                len(daily["weather_code"]),
+            ]
+            forecast_len = min(required_lengths)
+            forecast = [
+                {
+                    "date": days[i],
+                    "temp_max": daily["temperature_2m_max"][i],
+                    "temp_min": daily["temperature_2m_min"][i],
+                    "precipitation_probability": precipitation[i] if i < len(precipitation) else None,
+                    "condition": describe_weather_code(daily["weather_code"][i]),
+                }
+                for i in range(forecast_len)
+            ]
+        except KeyError as exc:
+            return AgentResult(
+                agent=self.name,
+                status=AgentStatus.FAILING,
+                error=f"Unexpected Open-Meteo response shape, missing field: {exc}",
+            )
+
         data = {
             "location": self._coords.resolved_name,
             "current": {
@@ -146,15 +178,6 @@ class WeatherAgent(BaseAgent):
                 "condition": describe_weather_code(current.get("weather_code")),
                 "wind_speed": current.get("wind_speed_10m"),
             },
-            "forecast": [
-                {
-                    "date": days[i],
-                    "temp_max": daily["temperature_2m_max"][i],
-                    "temp_min": daily["temperature_2m_min"][i],
-                    "precipitation_probability": precipitation[i] if i < len(precipitation) else None,
-                    "condition": describe_weather_code(daily["weather_code"][i]),
-                }
-                for i in range(len(days))
-            ],
+            "forecast": forecast,
         }
         return AgentResult(agent=self.name, status=AgentStatus.WORKING, data=data)
