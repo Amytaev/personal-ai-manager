@@ -1,18 +1,21 @@
-"""Entrypoint (Phase 3: Core Infrastructure + Telegram Bot).
+"""Entrypoint (Phase 4: Core Infrastructure + Telegram Bot + Weather Agent).
 
 Wires together config, logging, the single-instance guard, the SQLite
-database, the scheduler and now the Telegram bot. Teams, Weather and
-VALORANT agents are still Phase 4/5/6, and the AI Manager that would
-aggregate/prioritize/summarize them is Phase 7 - /tasks, /weather,
-/store and /briefing read straight from the (currently empty) SQLite
-tables and say so honestly until those phases land.
+database, the scheduler, the Telegram bot and now the Weather Agent.
+Teams and VALORANT agents are still Phase 5/6, and the AI Manager that
+would aggregate/prioritize/summarize everything is Phase 7 - /tasks
+and /store still say so honestly; /weather and /briefing now show
+real data once the agent has run at least once.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import signal
 
+from agents.runner import run_and_record
+from agents.weather import WeatherAgent
 from config import load_config
 from logging_config import setup_logging
 from scheduler.scheduler import Scheduler, SingleInstanceError, SingleInstanceGuard
@@ -26,6 +29,17 @@ logger = logging.getLogger(__name__)
 async def _daily_retention_cleanup(db: Database, retention_days: int) -> None:
     deleted = db.cleanup(retention_days)
     logger.info("Retention cleanup: %s", deleted)
+
+
+async def _weather_cycle(agent: WeatherAgent, db: Database) -> None:
+    result = await run_and_record(agent, db)
+    if result.status.value == "working":
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO weather_snapshots (location, payload_json, created_at) "
+                "VALUES (?, ?, ?)",
+                (result.data.get("location", ""), json.dumps(result.data, ensure_ascii=False), result.timestamp),
+            )
 
 
 async def main() -> None:
@@ -43,21 +57,39 @@ async def main() -> None:
     wishlist = WishlistStore(config.wishlist_path)
     scheduler = Scheduler()
     bot: TelegramBot | None = None
+    weather_agent: WeatherAgent | None = None
 
     # Everything from here on is inside one try/finally so that a failure
-    # at ANY startup step (scheduler, or - discovered while testing this -
-    # the Telegram bot failing to reach api.telegram.org, e.g. no network
-    # or a bad token) still releases the single-instance lock. Without
-    # this, a crash during bot.start() left the lock file behind forever,
-    # so every later run falsely reported "Application already running"
-    # even though nothing was actually running.
+    # at ANY startup step (scheduler, the Telegram bot failing to reach
+    # api.telegram.org, etc.) still releases the single-instance lock -
+    # see the Phase 3 postmortem in this file's git history for why that
+    # matters (a leaked lock file used to falsely block every later run).
     try:
         scheduler.register(
             job_id="retention_cleanup",
             interval_minutes=24 * 60,
             func=lambda: _daily_retention_cleanup(db, config.data_retention_days),
         )
+
+        if config.weather_location:
+            weather_agent = WeatherAgent(location=config.weather_location)
+            scheduler.register(
+                job_id="weather_check",
+                interval_minutes=config.weather_interval_minutes,
+                func=lambda: _weather_cycle(weather_agent, db),
+            )
+        else:
+            logger.warning("WEATHER_LOCATION not set - Weather Agent will not run")
+
         scheduler.start()
+
+        if weather_agent is not None:
+            # Run once immediately at startup, in addition to the
+            # periodic job below - otherwise /weather would show nothing
+            # for up to WEATHER_INTERVAL_MINUTES after every restart.
+            # _weather_cycle already catches expected failures via
+            # run_and_record/run_isolated, so this can't crash startup.
+            await _weather_cycle(weather_agent, db)
 
         if config.telegram_bot_token and config.telegram_chat_id:
             bot = TelegramBot(config=config, db=db, wishlist=wishlist)
@@ -98,18 +130,21 @@ async def main() -> None:
         # longer inside this coroutine. `finally` runs on any exception,
         # so cleanup happens on the graceful SIGTERM/SIGINT path
         # (Linux/Mac), the Ctrl+C/CancelledError path (Windows), AND a
-        # startup failure above (e.g. bot.start() raising).
+        # startup failure above.
         #
         # Each cleanup step is wrapped individually so that one failing
-        # (e.g. scheduler.shutdown() raising because it was never
-        # successfully started) can never prevent guard.release() from
-        # running - a leaked lock file is worse than a partially clean
-        # shutdown.
+        # can never prevent guard.release() from running - a leaked lock
+        # file is worse than a partially clean shutdown.
         if bot is not None:
             try:
                 await bot.stop()
             except Exception:  # noqa: BLE001 - best-effort cleanup boundary
                 logger.exception("Error while stopping the Telegram bot")
+        if weather_agent is not None:
+            try:
+                await weather_agent.aclose()
+            except Exception:  # noqa: BLE001 - best-effort cleanup boundary
+                logger.exception("Error while closing the Weather Agent's HTTP client")
         try:
             await scheduler.shutdown(wait=True)
         except Exception:  # noqa: BLE001 - best-effort cleanup boundary

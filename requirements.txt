@@ -6,6 +6,9 @@ anthropic
 # --- Phase 3 (Telegram Bot) - actually used now ---
 python-telegram-bot>=21,<22
 
+# --- Phase 4 (Weather Agent) - actually used now ---
+httpx
+
 # --- Testing ---
 pytest
 pytest-asyncio
@@ -13,5 +16,4 @@ pytest-mock
 
 # --- Future phases (listed here for reference, not yet imported by any code) ---
 # playwright            # Phase 5: Teams browser automation fallback
-# httpx                 # Phase 4/6: Weather + VALORANT HTTP clients
 # keyring               # Phase 3/5: DPAPI-backed secret storage on Windows (see note below)
