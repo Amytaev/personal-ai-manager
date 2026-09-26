@@ -37,7 +37,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agents.teams.auth import TeamsSession
+from agents.teams.auth import TEAMS_URL, TeamsSession
 from config import load_config
 
 CAPTURE_DIR = Path("teams_capture")
@@ -65,6 +65,12 @@ async def main() -> None:
     # a fixed login flow.
     context = await session._ensure_context(headless=False)  # noqa: SLF001 - intentional, see above
     page = await context.new_page()
+    # BUG FIX: a freshly opened page starts on about:blank. Without this
+    # goto, the visible window has nothing in it and there's nothing for
+    # the user to click into - confirmed by a real run where the window
+    # opened blank and then closed. Navigate to Teams itself so the saved
+    # login session kicks in and the user lands on their actual Teams UI.
+    await page.goto(TEAMS_URL, wait_until="domcontentloaded")
 
     captured = {"count": 0}
 
