@@ -35,7 +35,7 @@ import json
 from agents.teams.auth import TEAMS_URL, TeamsSession
 from config import load_config
 
-_INTERESTING_SUBSTRINGS = ("edu/me/work", "edu/classes")
+_INTERESTING_SUBSTRINGS = ("edu.cloud.microsoft",)
 
 
 async def main() -> None:
@@ -102,7 +102,25 @@ async def main() -> None:
         return
 
     print(f"\nClicked via: {clicked_with!r}. Waiting for the page to settle and fire its own requests...")
-    await page.wait_for_timeout(6_000)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15_000)
+    except Exception:  # noqa: BLE001 - best-effort extra settle time, not fatal
+        pass
+    await page.wait_for_timeout(4_000)
+
+    # Debug aid: what did the click actually land on? Top-level URL stays
+    # static (SPA), but a screenshot + frame list shows the real result
+    # regardless, same as teams_agent_navigation_test.py already does.
+    print(f"\nTop-level page URL after click: {page.url}")
+    print("Frames on this page:")
+    for frame in page.frames:
+        if frame.url:
+            print(f"  frame: {frame.url}")
+    screenshot_path = "teams_capture/click_test_result.png"
+    import pathlib
+    pathlib.Path("teams_capture").mkdir(parents=True, exist_ok=True)
+    await page.screenshot(path=screenshot_path, full_page=True)
+    print(f"Saved a screenshot of the result to: {screenshot_path} - open it to see what actually got clicked.")
 
     print(f"\n{len(captured)} matching response(s) captured.")
     if captured:
