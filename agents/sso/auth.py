@@ -145,20 +145,27 @@ class SsoSession:
             await self._playwright.stop()
             self._playwright = None
 
-    async def is_logged_in(self) -> bool:
-        """Headless check via the real Auth/IsAuthenticated endpoint (see
-        this module's docstring) - not a URL-comparison guess. Used by
+    async def is_logged_in(self, headless: bool = True) -> bool:
+        """Check via the real Auth/IsAuthenticated endpoint (see this
+        module's docstring) - not a URL-comparison guess. Used by
         SsoAgent before every fetch cycle: a plain automated read against
         the same persistent profile a signed-in browser would use, not
         an evasion technique (same TZ v4 §3.4 discipline as Teams/
         VALORANT).
+
+        headless defaults to True (SsoAgent/every other caller only ever
+        wants a headless check). login_via_autofill() below is the one
+        exception - it passes its own headless setting through so this
+        reuses the SAME context instead of forcing a close/reopen
+        (see login_via_autofill()'s docstring for why that switch is
+        risky, not just wasteful).
 
         Any non-200 response, or a body that isn't the literal JSON
         ``true``, is treated as "not logged in" - see the docstring's
         honest-limitation note on why this is a safe default rather than
         a confirmed expired-session shape.
         """
-        context = await self._ensure_context(headless=True)
+        context = await self._ensure_context(headless=headless)
         response = await context.request.get(IS_AUTHENTICATED_URL, timeout=15_000)
         if not response.ok:
             return False
@@ -206,7 +213,7 @@ class SsoSession:
             f"Login was not completed within {timeout_seconds}s (last URL: {last_url})"
         )
 
-    async def login_via_autofill(self, headless: bool = True, timeout_seconds: int = 20) -> bool:
+    async def login_via_autofill(self, headless: bool = False, timeout_seconds: int = 20) -> bool:
         """Re-authenticates using ONLY Chromium's own saved-password
         autofill for this profile (Desae confirmed directly, 2026-09-27:
         he saved his SSO password via the browser's own "Save password?"
@@ -248,15 +255,28 @@ class SsoSession:
         is no programmatic way around that; a human still has to log in
         by hand at that point (scripts/sso_login_setup.py).
 
-        headless defaults to True (not False like login_interactively())
-        on purpose: is_logged_in() below always reuses a headless
-        context, and calling it right after a headED login here would
-        force _ensure_context() to close-and-reopen headless mid-call -
-        exactly the close/reopen sequence that, earlier the same day
-        this method was written, needed a 3s pause to reliably avoid a
-        cookie-flush race (see scripts/sso_login_setup.py's history).
-        Staying headless throughout sidesteps that risk entirely rather
-        than re-relying on a timing workaround.
+        headless defaults to FALSE - confirmed live (2026-09-27,
+        scripts/sso_diagnose_headed_autofill.py): the password field
+        autofilled within 10s headed, but scripts/sso_test_autofill_login.py's
+        headless=True run timed out after 20s with no autofill at all in
+        the same profile. Not a guess - Chromium suppressing/limiting
+        password autofill under headless is a real difference some
+        Chromium builds/modes have, and this project isn't going to
+        fight it with a longer timeout that would never actually pass.
+        HONEST COST: an actual visible window opens on the desktop for
+        this, which matters if this ever gets wired into an unattended
+        background run.py cycle (not done yet).
+
+        The is_logged_in() confirmation below is called with
+        self.is_logged_in(headless=headless) - NOT the bare
+        self.is_logged_in() every other caller uses - specifically so it
+        reuses the SAME context this method already has open instead of
+        forcing a close/reopen. That close/reopen sequence is exactly
+        what, earlier the same day this method was written, needed a 3s
+        pause to reliably avoid a cookie-flush race (see
+        scripts/sso_login_setup.py's history) - passing headless through
+        sidesteps that risk entirely rather than re-relying on a timing
+        workaround, regardless of which headless value is used here.
         """
         context = await self._ensure_context(headless=headless)
         page = await context.new_page()
@@ -291,7 +311,7 @@ class SsoSession:
                     f"Browser context failed during/after the login click: {exc!r}"
                 ) from exc
 
-            if not await self.is_logged_in():
+            if not await self.is_logged_in(headless=headless):
                 raise SsoAutofillLoginFailed(
                     "Clicked the login button, but Auth/IsAuthenticated still says false - "
                     "the saved credentials are most likely stale (password changed)."

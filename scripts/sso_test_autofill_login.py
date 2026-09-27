@@ -71,7 +71,13 @@ async def main() -> None:
         print(f"\nis_logged_in() before autofill login: {before}")
 
         try:
-            await session.login_via_autofill(headless=True)
+            # headless=False is login_via_autofill()'s own default now -
+            # confirmed live (2026-09-27) that headless suppresses
+            # autofill in this profile entirely (see
+            # scripts/sso_diagnose_headed_autofill.py) - passed
+            # explicitly here just so it's obvious from reading this
+            # script, not hidden behind a default.
+            await session.login_via_autofill(headless=False)
             print("login_via_autofill(): succeeded (Auth/IsAuthenticated confirmed true).")
         except SsoAutofillLoginFailed as exc:
             print(f"login_via_autofill(): FAILED - {exc}")

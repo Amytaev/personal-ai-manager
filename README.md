@@ -805,10 +805,20 @@ Chromium для конкретно этой формы (один сохранё�
 и здесь программного обхода нет, тогда снова нужен человек
 (`scripts/sso_login_setup.py`).
 
-`headless=True` по умолчанию — намеренно, чтобы не провоцировать
-headed→headless переключение контекста внутри `is_logged_in()`
-(риск гонки записи cookie на диск, с которой разбирались чуть раньше
-в этом же файле — см. историю `scripts/sso_login_setup.py`).
+`headless=False` по умолчанию — подтверждено вживую (2026-09-27), а не
+предположение: поле пароля заполнилось за 10с в видимом окне
+(`scripts/sso_diagnose_headed_autofill.py`), но НЕ заполнилось за 20с
+в headless-режиме на том же самом профиле
+(`scripts/sso_test_autofill_login.py`) — Chromium в headless просто не
+подставляет сохранённый пароль в этой сборке. Честная цена: реальное
+видимое окно открывается на рабочем столе — важно, если это когда-нибудь
+подключат к фоновому `run.py` без участия человека (пока не подключено).
+`is_logged_in()` внутри метода вызывается с тем же `headless`, что и сам
+метод (не голым `is_logged_in()` со своим дефолтом `True`) — специально,
+чтобы переиспользовать уже открытый контекст, а не провоцировать
+headed→headless переключение (риск гонки записи cookie на диск, с
+которой разбирались чуть раньше в этом же файле — см. историю
+`scripts/sso_login_setup.py`).
 
 Проверочный скрипт `scripts/sso_test_autofill_login.py` — честный тест:
 сначала удаляет только куки профиля (никогда не `Login Data`, где живёт
@@ -818,7 +828,7 @@ headed→headless переключение контекста внутри `is_l
 
 ## Тесты
 
-**194 теста, все проходят**: 56 из Phase 2-4 (core infra, БД,
+**195 тестов, все проходят**: 56 из Phase 2-4 (core infra, БД,
 scheduler/retry, Weather Agent, Telegram auth/wishlist, LLM provider —
 включая 4 для чата с Claude, `Handlers.chat`) + 43 из Phase 5 (18 для
 Teams-парсера, 8 для `TeamsSession` (включая 2 на исправленный
@@ -827,16 +837,17 @@ Teams-парсера, 8 для `TeamsSession` (включая 2 на испра�
 (`wait_for_load_state`) и 2 на скриншот-диагностику при падении — из
 Phase 6.3, см. выше) + 20 для
 VALORANT (Phase 6) + 8 в `test_telegram_handlers.py` для `/store` с
-картинками (Phase 6.3) + **50 новых для SSO Agent (Этап B)**: 18 в
+картинками (Phase 6.3) + **51 новый для SSO Agent (Этап B)**: 18 в
 `test_sso_parser.py` (`pick_current_semester_id`, `parse_courses`,
 `parse_schedule` — включая чтение времени из container, а не из
 lesson, `iter_umkd_leaf_folders`/`build_umkd_path_by_folder_id`,
-`parse_materials`), 13 в `test_sso_auth.py` (`is_logged_in()`
+`parse_materials`), 14 в `test_sso_auth.py` (`is_logged_in()`
 true/false по реальному ответу `Auth/IsAuthenticated`, не-JSON тело,
 `login_interactively()`/`SsoLoginTimeout`, пересоздание контекста при
-смене headless-режима, плюс 4 на `login_via_autofill()` — успех,
+смене headless-режима, плюс 5 на `login_via_autofill()` — успех,
 `SsoAutofillLoginFailed` когда пароль не заполнился и когда протух
-после клика, `headless=True` по умолчанию), 6 в `test_sso_agent.py` (`SsoAgent.run()` на
+после клика, `headless=False` по умолчанию, передача своего `headless`
+в `is_logged_in()` вместо его собственного дефолта), 6 в `test_sso_agent.py` (`SsoAgent.run()` на
 замоканном `context.request.get`: полный успешный прогон пишет в БД,
 `needs_reauth=True` когда сессия не залогинена, `FAILING` без
 `needs_reauth` когда семестров нет, одна упавшая папка УМКД не валит

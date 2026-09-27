@@ -228,7 +228,7 @@ async def test_login_via_autofill_raises_when_still_not_authenticated_after_clic
 
 
 @pytest.mark.asyncio
-async def test_login_via_autofill_defaults_to_headless(tmp_path):
+async def test_login_via_autofill_defaults_to_headed(tmp_path):
     mock_cm, mock_chromium, _, mock_page = _make_mock_playwright()
     _wire_autofill_page(mock_page)
 
@@ -237,11 +237,28 @@ async def test_login_via_autofill_defaults_to_headless(tmp_path):
         session.is_logged_in = AsyncMock(return_value=True)
         await session.login_via_autofill()
 
-    # Defaults to headless=True on purpose - see login_via_autofill()'s
-    # docstring on why (avoids the headed->headless close/reopen cookie-
-    # flush race is_logged_in() would otherwise trigger mid-call).
+    # Defaults to headless=False - confirmed live (2026-09-27): password
+    # autofill worked headed but timed out headless in the same real
+    # profile (scripts/sso_diagnose_headed_autofill.py vs.
+    # scripts/sso_test_autofill_login.py) - not a guess.
     call_kwargs = mock_chromium.launch_persistent_context.call_args.kwargs
-    assert call_kwargs["headless"] is True
+    assert call_kwargs["headless"] is False
+
+
+@pytest.mark.asyncio
+async def test_login_via_autofill_passes_its_own_headless_value_to_is_logged_in(tmp_path):
+    mock_cm, _, _, mock_page = _make_mock_playwright()
+    _wire_autofill_page(mock_page)
+
+    with patch("agents.sso.auth.async_playwright", return_value=mock_cm):
+        session = SsoSession(tmp_path / "profile")
+        session.is_logged_in = AsyncMock(return_value=True)
+        await session.login_via_autofill(headless=False)
+
+    # Must reuse the SAME headless mode it just used to log in, not the
+    # bare is_logged_in()'s own headless=True default - see
+    # login_via_autofill()'s docstring on why that switch is risky.
+    session.is_logged_in.assert_awaited_once_with(headless=False)
 
 
 @pytest.mark.asyncio
