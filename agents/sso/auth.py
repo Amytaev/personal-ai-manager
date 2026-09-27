@@ -311,10 +311,32 @@ class SsoSession:
                     f"Browser context failed during/after the login click: {exc!r}"
                 ) from exc
 
-            if not await self.is_logged_in(headless=headless):
+            # Real result hit live (2026-09-27): a single is_logged_in()
+            # check RIGHT after the click came back false even with the
+            # correct, still-working saved password (confirmed working
+            # for manual logins the same day) - most likely the click's
+            # own navigation/redirect handshake with the server hadn't
+            # finished setting the real auth cookie yet by the time this
+            # ran. login_interactively() already polls instead of
+            # checking once for exactly this class of timing issue - do
+            # the same here rather than trusting a single immediate read.
+            elapsed_ms = 0
+            poll_interval_ms = 1_000
+            post_click_timeout_ms = 10_000
+            confirmed = False
+            while elapsed_ms < post_click_timeout_ms:
+                if await self.is_logged_in(headless=headless):
+                    confirmed = True
+                    break
+                await page.wait_for_timeout(poll_interval_ms)
+                elapsed_ms += poll_interval_ms
+
+            if not confirmed:
                 raise SsoAutofillLoginFailed(
-                    "Clicked the login button, but Auth/IsAuthenticated still says false - "
-                    "the saved credentials are most likely stale (password changed)."
+                    "Clicked the login button, but Auth/IsAuthenticated still said false "
+                    f"after polling for {post_click_timeout_ms // 1000}s - either the saved "
+                    "credentials are stale (password changed), or something else about the "
+                    "login handshake didn't complete."
                 )
             logger.info("SSO autofill login succeeded (profile: %s).", self.profile_dir)
             return True
