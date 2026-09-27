@@ -211,6 +211,168 @@ async def test_store_warns_when_last_agent_run_failed_but_shows_stale_data(handl
 
 
 @pytest.mark.asyncio
+async def test_schedule_honest_when_no_semester_saved_yet(handlers):
+    update, context = _fake_update_and_context()
+    await handlers.schedule(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "не запускался" in text
+
+
+@pytest.mark.asyncio
+async def test_schedule_honest_when_semester_known_but_empty(handlers, tmp_db):
+    tmp_db.save_sso_snapshot(
+        semester_id=85, courses=[{"code": "C1", "title": "Course"}], schedule_entries=[], materials=[]
+    )
+
+    update, context = _fake_update_and_context()
+    await handlers.schedule(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "85" in text and "записей пока нет" in text
+
+
+@pytest.mark.asyncio
+async def test_schedule_groups_by_day_in_real_weekday_order_not_alphabetical(handlers, tmp_db):
+    tmp_db.save_sso_snapshot(
+        semester_id=85,
+        courses=[],
+        schedule_entries=[
+            {
+                "class_id": 1,
+                "course_code": "CSE4112",
+                "course_title": "Администрирование систем и сетей",
+                "instructor_name": "Иванов И.И.",
+                "room_title": "301",
+                "class_type": "Лекция",
+                "day_title": "TUESDAY_SHORT",
+                "start_time": "10:00",
+                "end_time": "10:50",
+            },
+            {
+                "class_id": 2,
+                "course_code": "CSE5472",
+                "course_title": "НИРС",
+                "instructor_name": "Петров П.П.",
+                "room_title": "212",
+                "class_type": "Практика",
+                "day_title": "MONDAY_SHORT",
+                "start_time": "8:55",
+                "end_time": "9:45",
+            },
+        ],
+        materials=[],
+    )
+
+    update, context = _fake_update_and_context()
+    await handlers.schedule(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    # MONDAY_SHORT ("Понедельник") must appear before TUESDAY_SHORT
+    # ("Вторник") even though alphabetically Tuesday's Russian label
+    # sorts first - real weekday order, not a raw ORDER BY day_title.
+    assert text.index("Понедельник") < text.index("Вторник")
+    assert "CSE4112" in text and "301" in text and "Иванов И.И." in text
+
+
+@pytest.mark.asyncio
+async def test_schedule_warns_when_last_sso_run_failed_but_shows_stale_data(handlers, tmp_db):
+    tmp_db.save_sso_snapshot(
+        semester_id=85,
+        courses=[],
+        schedule_entries=[{"class_id": 1, "day_title": "MONDAY_SHORT", "start_time": "8:55", "end_time": "9:45"}],
+        materials=[],
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    tmp_db.record_agent_run("sso", "failing", now, now, "SSO_NEEDS_REAUTH")
+
+    update, context = _fake_update_and_context()
+    await handlers.schedule(update, context)
+
+    warning_text = update.message.reply_text.call_args_list[0].args[0]
+    assert "устаревш" in warning_text.lower() or "ошибк" in warning_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_umkd_honest_when_empty(handlers):
+    update, context = _fake_update_and_context()
+    await handlers.umkd(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "не запускался" in text
+
+
+@pytest.mark.asyncio
+async def test_umkd_without_args_shows_per_course_counts(handlers, tmp_db):
+    tmp_db.save_sso_snapshot(
+        semester_id=85,
+        courses=[],
+        schedule_entries=[],
+        materials=[
+            {"file_id": 1, "folder_id": 1, "file_name": "a.docx", "course_title": "CSE4112 Сети"},
+            {"file_id": 2, "folder_id": 1, "file_name": "b.docx", "course_title": "CSE4112 Сети"},
+            {"file_id": 3, "folder_id": 2, "file_name": "c.docx", "course_title": "CSE5472 НИРС"},
+        ],
+    )
+
+    update, context = _fake_update_and_context()
+    await handlers.umkd(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "всего материалов: 3" in text
+    assert "CSE4112 Сети: 2" in text
+    assert "CSE5472 НИРС: 1" in text
+
+
+@pytest.mark.asyncio
+async def test_umkd_with_query_filters_by_course_and_lists_files(handlers, tmp_db):
+    tmp_db.save_sso_snapshot(
+        semester_id=85,
+        courses=[],
+        schedule_entries=[],
+        materials=[
+            {
+                "file_id": 1,
+                "folder_id": 1,
+                "file_name": "Лекция 1.pdf",
+                "file_category_title": "Лекции",
+                "course_title": "CSE4112 Администрирование систем и сетей",
+            },
+            {
+                "file_id": 2,
+                "folder_id": 2,
+                "file_name": "Практика 1.docx",
+                "file_category_title": "Практика",
+                "course_title": "CSE5472 НИРС",
+            },
+        ],
+    )
+
+    update, context = _fake_update_and_context(args=["4112"])
+    await handlers.umkd(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "Лекция 1.pdf" in text
+    assert "Практика 1.docx" not in text
+
+
+@pytest.mark.asyncio
+async def test_umkd_with_query_no_match_says_so(handlers, tmp_db):
+    tmp_db.save_sso_snapshot(
+        semester_id=85,
+        courses=[],
+        schedule_entries=[],
+        materials=[{"file_id": 1, "folder_id": 1, "file_name": "a.docx", "course_title": "CSE4112 Сети"}],
+    )
+
+    update, context = _fake_update_and_context(args=["nonexistent"])
+    await handlers.umkd(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "не найдено" in text
+
+
+@pytest.mark.asyncio
 async def test_briefing_reports_all_three_sections_as_empty(handlers):
     update, context = _fake_update_and_context()
     await handlers.briefing(update, context)

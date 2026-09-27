@@ -26,10 +26,10 @@ from storage.wishlist import WishlistStore
 
 logger = logging.getLogger(__name__)
 
-# The three agents named in the TZ - teams (Phase 5), weather (Phase 4)
-# and valorant (Phase 6) are all implemented now and run on the
-# scheduler. /status reports on all three by name.
-KNOWN_AGENTS = ("teams", "weather", "valorant")
+# teams (Phase 5), weather (Phase 4), valorant (Phase 6) and sso (Этап B)
+# are all implemented now and run on the scheduler. /status reports on
+# all four by name.
+KNOWN_AGENTS = ("teams", "weather", "valorant", "sso")
 
 STATUS_MARKERS = {"working": "✅", "degraded": "\U0001f7e1", "failing": "\U0001f534"}
 
@@ -38,6 +38,57 @@ STATUS_MARKERS = {"working": "✅", "degraded": "\U0001f7e1", "failing": "\U0001
 # 4) would still need a cap so a single /store call can't blow past
 # Telegram's own limit.
 _MAX_MEDIA_GROUP_ITEMS = 10
+
+# GetTable's real column titles (agents/sso/parser.py's docstring/tests -
+# e.g. "MONDAY_SHORT") are English weekday codes, not Russian day names
+# and not in weekday order - ORDER BY day_title (storage/database.py's
+# get_sso_schedule) is alphabetical, so /schedule below re-sorts by real
+# weekday order and shows a Russian label instead, purely for display.
+_SSO_WEEKDAY_LABELS = {
+    "MONDAY_SHORT": "Понедельник",
+    "TUESDAY_SHORT": "Вторник",
+    "WEDNESDAY_SHORT": "Среда",
+    "THURSDAY_SHORT": "Четверг",
+    "FRIDAY_SHORT": "Пятница",
+    "SATURDAY_SHORT": "Суббота",
+    "SUNDAY_SHORT": "Воскресенье",
+}
+_SSO_WEEKDAY_ORDER = list(_SSO_WEEKDAY_LABELS)
+
+# Real /umkd data can be large (226 materials seen in a live run across
+# ~7 courses) - a filtered /umkd <course> listing is capped so a single
+# unusually large course folder can't blow past Telegram's ~4096 char
+# message limit the way an uncapped /store-style dump could.
+_MAX_UMKD_LINES = 60
+
+
+def _sso_day_label(day_title: str | None) -> str:
+    if day_title is None:
+        return "?"
+    return _SSO_WEEKDAY_LABELS.get(day_title, day_title)
+
+
+def _sso_day_sort_key(day_title: str | None) -> int:
+    try:
+        return _SSO_WEEKDAY_ORDER.index(day_title)
+    except ValueError:
+        # An unrecognized day_title (future API change, bad data) still
+        # gets shown - just sorted after every known weekday rather than
+        # dropped.
+        return len(_SSO_WEEKDAY_ORDER)
+
+
+def _sso_schedule_line(entry) -> str:
+    start = entry["start_time"] or "?"
+    end = entry["end_time"] or "?"
+    code = entry["course_code"]
+    title = entry["course_title"] or "?"
+    course = f"[{code}] {title}" if code else title
+    class_type = entry["class_type"]
+    type_part = f" ({class_type})" if class_type else ""
+    where = entry["room_title"] or "?"
+    who = entry["instructor_name"] or "?"
+    return f"  {start}–{end} {course}{type_part} — {where}, {who}"
 
 
 def _parse_store_payload(skins_json: str) -> tuple[list[dict], str | None] | None:
@@ -111,6 +162,8 @@ class Handlers:
             "/tasks - учебные задания (Teams)\n"
             "/weather - текущая погода\n"
             "/store - магазин VALORANT (с картинками скинов)\n"
+            "/schedule - расписание занятий (SSO)\n"
+            "/umkd [курс] - материалы УМКД (SSO); без аргумента - список курсов со счётчиками\n"
             "/briefing - общая сводка\n"
             "/wishlist - список желаемых скинов\n"
             "/addskin <название> - добавить в wishlist\n"
@@ -245,6 +298,106 @@ class Handlers:
         if reset_in:
             tail_lines.append(f"\n⏳ Сброс через: {reset_in}")
         await update.message.reply_text("\n".join(tail_lines))
+
+    async def schedule(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Shows the SSO Agent's collected weekly schedule (Этап B data -
+        stud.satbayev.university's real GetTable API, agents/sso/parser.py).
+
+        Same honest-degradation shape as /tasks: "no semester saved yet"
+        (agent never ran/never got past IsAuthenticated) is a different
+        message from "semester known but empty" (get_sso_schedule
+        returned nothing for it), and a failed LAST run still shows
+        whatever was last saved successfully, with a stale-data warning -
+        exactly like /store does for VALORANT via last_run().
+        """
+        semester_id = self.db.get_latest_sso_semester_id()
+        if semester_id is None:
+            await update.message.reply_text(
+                "Расписание пока недоступно — SSO Agent либо ещё не запускался, либо не "
+                "смог авторизоваться в sso.satbayev.university. Проверь /status: sso."
+            )
+            return
+
+        last_run = self.db.last_run("sso")
+        if last_run is not None and last_run["status"] != "working":
+            await update.message.reply_text(
+                f"⚠️ Последний прогон SSO Agent завершился с ошибкой ({last_run['status']}) — "
+                f"ниже последнее успешно сохранённое расписание, оно может быть устаревшим."
+            )
+
+        rows = self.db.get_sso_schedule(semester_id)
+        if not rows:
+            await update.message.reply_text(
+                f"\U0001f4c5 Расписание (семестр {semester_id}): записей пока нет."
+            )
+            return
+
+        by_day: dict[str | None, list] = {}
+        for row in rows:
+            by_day.setdefault(row["day_title"], []).append(row)
+
+        lines = [f"\U0001f4c5 Расписание (семестр {semester_id}):"]
+        for day_title in sorted(by_day, key=_sso_day_sort_key):
+            lines.append(f"\n{_sso_day_label(day_title)}:")
+            day_rows = sorted(by_day[day_title], key=lambda r: r["start_time"] or "")
+            lines.extend(_sso_schedule_line(row) for row in day_rows)
+
+        await update.message.reply_text("\n".join(lines))
+
+    async def umkd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Shows the SSO Agent's collected УМКД (study materials) metadata
+        only - names/categories/course, never the files themselves (see
+        agents/sso/parser.py's docstring: Umkd/Download is deliberately
+        never called, so there's nothing to download here either).
+
+        No argument: a per-course summary (real data is ~7 courses, so
+        this always fits one message) plus how to drill into one.
+        With an argument: filters to courses whose title contains it
+        (case-insensitive substring) and lists every matching file,
+        capped at _MAX_UMKD_LINES so one unusually large course folder
+        can't blow past Telegram's message-length limit.
+        """
+        materials = self.db.get_sso_materials()
+        if not materials:
+            await update.message.reply_text(
+                "УМКД данных пока нет — SSO Agent либо ещё не запускался, либо не нашёл ни "
+                "одной папки с материалами. Проверь /status: sso."
+            )
+            return
+
+        last_run = self.db.last_run("sso")
+        if last_run is not None and last_run["status"] != "working":
+            await update.message.reply_text(
+                f"⚠️ Последний прогон SSO Agent завершился с ошибкой ({last_run['status']}) — "
+                f"ниже последние успешно сохранённые материалы, они могут быть устаревшими."
+            )
+
+        query = " ".join(context.args).strip().lower() if context.args else None
+
+        if not query:
+            counts: dict[str, int] = {}
+            for material in materials:
+                course = material["course_title"] or "Без курса"
+                counts[course] = counts.get(course, 0) + 1
+            lines = [f"\U0001f4da УМКД — всего материалов: {len(materials)}\n"]
+            lines.extend(f"• {course}: {count}" for course, count in sorted(counts.items()))
+            lines.append("\nПодробнее: /umkd <название курса>")
+            await update.message.reply_text("\n".join(lines))
+            return
+
+        matched = [m for m in materials if query in (m["course_title"] or "").lower()]
+        if not matched:
+            await update.message.reply_text(f"По запросу «{query}» материалов не найдено.")
+            return
+
+        lines = [f"\U0001f4da УМКД по запросу «{query}» ({len(matched)}):"]
+        shown = matched[:_MAX_UMKD_LINES]
+        for material in shown:
+            category = material["file_category_title"] or "?"
+            lines.append(f"• [{category}] {material['file_name']}")
+        if len(matched) > len(shown):
+            lines.append(f"\n… показаны первые {len(shown)} из {len(matched)}.")
+        await update.message.reply_text("\n".join(lines))
 
     async def briefing(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         with self.db.connect() as conn:

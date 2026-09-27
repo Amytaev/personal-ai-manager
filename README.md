@@ -4,12 +4,14 @@
 AI Manager → Telegram). Полное ТЗ см. `TZ_v4.md` (хранится отдельно).
 
 **Текущее состояние: Этап B — SSO Agent (Schedule + UMKD) добавлен поверх
-Phase 6.3.** Teams Agent (Phase 5), VALORANT Agent (Phase 6) и теперь SSO
-Agent (bro's ТЗ, Этап A/B) все реализованы и подключены в `run.py`,
-`/store` в Telegram показывает реальные скины с картинками, а протухшая
-сессия (Teams, Stack B или SSO) шлёт отдельное Telegram-уведомление
-вместо тихого падения. Study Manager, Checker Agent, Auth Checker Agent
-и Telegram Mini App из bro's ТЗ остаются нетронутыми — следующий шаг.
+Phase 6.3, плюс `/schedule`/`/umkd` в Telegram-боте.** Teams Agent
+(Phase 5), VALORANT Agent (Phase 6) и теперь SSO Agent (bro's ТЗ, Этап
+A/B) все реализованы и подключены в `run.py`, `/store` в Telegram
+показывает реальные скины с картинками, `/schedule`/`/umkd` показывают
+уже собранные SSO-данные, а протухшая сессия (Teams, Stack B или SSO)
+шлёт отдельное Telegram-уведомление вместо тихого падения. Study
+Manager, Checker Agent, Auth Checker Agent и Telegram Mini App из bro's
+ТЗ остаются нетронутыми — следующий шаг.
 
 ## Что уже есть
 
@@ -721,16 +723,38 @@ API, доступ — read-only, риск MITM на этом конкретно�
 прогонами без отдельного сигнала). Три новые таблицы описаны в
 `storage/models.py`.
 
+### `/schedule` и `/umkd` — Telegram-команды поверх уже собранных данных
+
+Не Study Manager/Phase 7 (никакой приоритизации, LLM-сводки или
+кросс-агентного объединения — просто прямое чтение уже сохранённых
+`sso_schedule_entries`/`sso_study_materials`), тот же принцип, что у
+`/tasks`/`/weather`/`/store` (`telegram_bot/handlers.py`): читать прямо
+из SQLite и честно показывать разницу между "агент ещё не запускался" и
+"запускался, но пусто", плюс предупреждение о протухших данных, если
+последний прогон `sso` упал (как у `/store` для VALORANT).
+
+- **`/schedule`** — расписание последнего известного семестра
+  (`Database.get_latest_sso_semester_id()` — своего отдельного указателя
+  "текущий семестр" `save_sso_snapshot()` не хранит, берётся
+  максимальный увиденный `semester_id`), сгруппированное по дням в
+  настоящем порядке недели (`MONDAY_SHORT` → `TUESDAY_SHORT` → …), а не
+  по алфавиту, как сырой `ORDER BY day_title` в `get_sso_schedule()`.
+- **`/umkd`** — без аргумента показывает список курсов со счётчиком
+  материалов (на реальных данных — 7 курсов, всегда влезает в одно
+  сообщение); `/umkd <часть названия курса>` — список файлов этого курса
+  (`file_name` + `file_category_title`), обрезанный до 60 строк на
+  случай необычно большой папки. Как и `agents/sso/parser.py`, никогда
+  не предлагает и не выполняет скачивание самого файла — только
+  метаданные, которые уже лежат в БД.
+
 ### Что не тронуто
 
 Auth Checker Agent, Checker Agent, Study Manager и Telegram Mini App из
-bro's ТЗ — вне рамок этого этапа, как и явно оговаривалось. У SSO Agent
-пока нет собственной команды в Telegram-боте — это территория Study
-Manager/Mini App.
+bro's ТЗ — вне рамок этого этапа, как и явно оговаривалось.
 
 ## Тесты
 
-**163 теста, все проходят**: 56 из Phase 2-4 (core infra, БД,
+**173 теста, все проходят**: 56 из Phase 2-4 (core infra, БД,
 scheduler/retry, Weather Agent, Telegram auth/wishlist, LLM provider —
 включая 4 для чата с Claude, `Handlers.chat`) + 43 из Phase 5 (18 для
 Teams-парсера, 8 для `TeamsSession` (включая 2 на исправленный
@@ -739,7 +763,7 @@ Teams-парсера, 8 для `TeamsSession` (включая 2 на испра�
 (`wait_for_load_state`) и 2 на скриншот-диагностику при падении — из
 Phase 6.3, см. выше) + 20 для
 VALORANT (Phase 6) + 8 в `test_telegram_handlers.py` для `/store` с
-картинками (Phase 6.3) + **36 новых для SSO Agent (Этап B)**: 18 в
+картинками (Phase 6.3) + **46 новых для SSO Agent (Этап B)**: 18 в
 `test_sso_parser.py` (`pick_current_semester_id`, `parse_courses`,
 `parse_schedule` — включая чтение времени из container, а не из
 lesson, `iter_umkd_leaf_folders`/`build_umkd_path_by_folder_id`,
@@ -750,9 +774,16 @@ true/false по реальному ответу `Auth/IsAuthenticated`, не-JSO
 замоканном `context.request.get`: полный успешный прогон пишет в БД,
 `needs_reauth=True` когда сессия не залогинена, `FAILING` без
 `needs_reauth` когда семестров нет, одна упавшая папка УМКД не валит
-весь прогон, `aclose()` закрывает только свою сессию) + 3 прямых теста
-`save_sso_snapshot()`/`get_sso_*` в `test_database.py`
-(запись/замещение по семестру/изоляция между семестрами).
+весь прогон, `aclose()` закрывает только свою сессию), 5 прямых тестов
+`save_sso_snapshot()`/`get_sso_*`/`get_latest_sso_semester_id()` в
+`test_database.py` (запись/замещение по семестру/изоляция между
+семестрами, последний семестр `None` до первого снапшота и
+максимальный увиденный после) и 8 в `test_telegram_handlers.py` для
+`/schedule`/`/umkd` (честная деградация "агент не запускался"/"пусто",
+реальный порядок дней недели вместо алфавитного, предупреждение о
+протухших данных при упавшем прогоне, счётчики по курсам без
+аргумента, фильтрация по подстроке названия курса, "не найдено" для
+пустого совпадения).
 
 - `tests/test_teams_parser.py` (18 тестов) — чистые функции
   `resolve_course_name`/`compute_status`/`parse_assignment`/

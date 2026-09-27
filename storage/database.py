@@ -232,6 +232,30 @@ class Database:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM sso_study_materials ORDER BY file_name").fetchall()
 
+    def get_latest_sso_semester_id(self) -> int | None:
+        """save_sso_snapshot() never records a separate "current semester"
+        pointer of its own - courses/schedule are simply stored per
+        semester_id (see save_sso_snapshot's docstring). Telegram commands
+        (telegram_bot/handlers.py's schedule()/status use) need SOME
+        semester to show without the user having to know an id, so this
+        just takes the highest semester_id seen - SsoAgent only ever
+        fetches parser.pick_current_semester_id()'s pick (the one the
+        portal itself flags as current), and Satbayev's ids increase over
+        time in every real capture so far, so the latest stored id is
+        always that same current semester. Returns None if the SSO Agent
+        has never successfully saved a snapshot. Checks both sso_courses
+        and sso_schedule_entries (not just courses) since either table
+        alone is enough evidence a semester_id exists - a capture could
+        in principle populate one and not the other."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(semester_id) AS semester_id FROM ("
+                "SELECT semester_id FROM sso_courses "
+                "UNION ALL SELECT semester_id FROM sso_schedule_entries"
+                ")"
+            ).fetchone()
+            return row["semester_id"] if row and row["semester_id"] is not None else None
+
     # -- notifications (dedup, TZ v4 §20/§22) ----------------------------
 
     def was_notified(self, kind: str, dedupe_key: str) -> bool:

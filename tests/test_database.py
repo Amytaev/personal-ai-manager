@@ -148,6 +148,17 @@ def test_save_sso_snapshot_does_not_touch_a_different_semesters_courses(tmp_db):
     assert [c["code"] for c in tmp_db.get_sso_courses(85)] == ["NEW"]
 
 
+def test_get_latest_sso_semester_id_is_none_before_any_snapshot(tmp_db):
+    assert tmp_db.get_latest_sso_semester_id() is None
+
+
+def test_get_latest_sso_semester_id_returns_the_highest_seen(tmp_db):
+    tmp_db.save_sso_snapshot(semester_id=80, courses=[{"code": "OLD", "title": "Old sem"}], schedule_entries=[], materials=[])
+    tmp_db.save_sso_snapshot(semester_id=85, courses=[{"code": "NEW", "title": "New sem"}], schedule_entries=[], materials=[])
+
+    assert tmp_db.get_latest_sso_semester_id() == 85
+
+
 def test_cleanup_does_not_touch_tasks_or_notifications(tmp_db):
     tmp_db.mark_notified("agent_status_change", "teams:failing")
 
