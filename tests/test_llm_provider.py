@@ -33,6 +33,7 @@ def _config(**overrides) -> AppConfig:
         teams_min_due_date=datetime(2026, 9, 1, tzinfo=timezone.utc),
         valorant_profile_path="data/valorant_browser_profile",
         sso_profile_path="data/sso_browser_profile",
+        semester1_week1_start=datetime(2026, 9, 1, tzinfo=timezone.utc),
     )
     base.update(overrides)
     return AppConfig(**base)

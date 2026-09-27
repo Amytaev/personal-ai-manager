@@ -35,6 +35,7 @@ def _config(tmp_path) -> AppConfig:
         teams_min_due_date=datetime(2026, 9, 1, tzinfo=timezone.utc),
         valorant_profile_path=str(tmp_path / "valorant_browser_profile"),
         sso_profile_path=str(tmp_path / "sso_browser_profile"),
+        semester1_week1_start=datetime(2026, 9, 1, tzinfo=timezone.utc),
     )
 
 

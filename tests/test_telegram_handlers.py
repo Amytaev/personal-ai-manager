@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -370,6 +370,74 @@ async def test_umkd_with_query_no_match_says_so(handlers, tmp_db):
 
     text = update.message.reply_text.call_args.args[0]
     assert "не найдено" in text
+
+
+@pytest.fixture
+def handlers_with_semester_start(tmp_db, tmp_path):
+    wishlist = WishlistStore(tmp_path / "wishlist.json")
+    config = MagicMock()
+    config.semester1_week1_start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    return Handlers(db=tmp_db, wishlist=wishlist, config=config)
+
+
+@pytest.mark.asyncio
+async def test_week_before_semester_start(handlers_with_semester_start):
+    update, context = _fake_update_and_context()
+    with patch("telegram_bot.handlers.today_in_kz", return_value=date(2026, 8, 15)):
+        await handlers_with_semester_start.week(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "не начался" in text
+
+
+@pytest.mark.asyncio
+async def test_week_reports_week_number_and_bounds_without_sso_data(handlers_with_semester_start):
+    update, context = _fake_update_and_context()
+    with patch("telegram_bot.handlers.today_in_kz", return_value=date(2026, 9, 10)):
+        await handlers_with_semester_start.week(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "2 из 15" in text
+    assert "лаба №2" in text
+    assert "ещё не запускался" in text
+
+
+@pytest.mark.asyncio
+async def test_week_lists_real_courses_when_sso_data_exists(handlers_with_semester_start, tmp_db):
+    tmp_db.save_sso_snapshot(
+        semester_id=85,
+        courses=[{"code": "CSE4112", "title": "Администрирование систем и сетей"}],
+        schedule_entries=[],
+        materials=[],
+    )
+
+    update, context = _fake_update_and_context()
+    with patch("telegram_bot.handlers.today_in_kz", return_value=date(2026, 9, 10)):
+        await handlers_with_semester_start.week(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "CSE4112" in text and "Администрирование систем и сетей" in text
+
+
+@pytest.mark.asyncio
+async def test_week_flags_first_attestation_week(handlers_with_semester_start):
+    update, context = _fake_update_and_context()
+    with patch("telegram_bot.handlers.today_in_kz", return_value=date(2026, 10, 20)):
+        await handlers_with_semester_start.week(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "8 из 15" in text
+    assert "1-я аттестация" in text
+
+
+@pytest.mark.asyncio
+async def test_week_after_teaching_ends(handlers_with_semester_start):
+    update, context = _fake_update_and_context()
+    with patch("telegram_bot.handlers.today_in_kz", return_value=date(2026, 12, 20)):
+        await handlers_with_semester_start.week(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "закончились" in text
 
 
 @pytest.mark.asyncio

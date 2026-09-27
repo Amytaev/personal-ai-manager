@@ -72,6 +72,7 @@ class AppConfig:
     teams_min_due_date: datetime
     valorant_profile_path: str
     sso_profile_path: str
+    semester1_week1_start: datetime
 
 
 def load_config() -> AppConfig:
@@ -116,4 +117,11 @@ def load_config() -> AppConfig:
         # channel, all dated April 2026). Defaults to the start of the
         # user's current semester; override in .env if that changes.
         teams_min_due_date=_date_env("TEAMS_MIN_DUE_DATE", "2026-09-01T00:00:00Z"),
+        # utils/academic_calendar.py's anchor for teaching week 1 - a
+        # separate var from TEAMS_MIN_DUE_DATE above even though they
+        # currently share the same real-world date, since they're
+        # different concepts (a task-filtering cutoff vs. the week
+        # counter's anchor) that could diverge - e.g. TEAMS_MIN_DUE_DATE
+        # might get bumped for a reason unrelated to the calendar rule.
+        semester1_week1_start=_date_env("SEMESTER1_WEEK1_START", "2026-09-01T00:00:00Z"),
     )

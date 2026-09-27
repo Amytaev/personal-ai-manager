@@ -23,6 +23,13 @@ from config import AppConfig
 from llm.provider import NullProvider, get_provider
 from storage.database import Database
 from storage.wishlist import WishlistStore
+from utils.academic_calendar import (
+    FIRST_ATTESTATION_WEEK,
+    TOTAL_TEACHING_WEEKS,
+    current_teaching_week,
+    teaching_week_bounds,
+    today_in_kz,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +171,7 @@ class Handlers:
             "/store - магазин VALORANT (с картинками скинов)\n"
             "/schedule - расписание занятий (SSO)\n"
             "/umkd [курс] - материалы УМКД (SSO); без аргумента - список курсов со счётчиками\n"
+            "/week - текущая учебная неделя (1-15) + номер лабы/практики\n"
             "/briefing - общая сводка\n"
             "/wishlist - список желаемых скинов\n"
             "/addskin <название> - добавить в wishlist\n"
@@ -397,6 +405,57 @@ class Handlers:
             lines.append(f"• [{category}] {material['file_name']}")
         if len(matched) > len(shown):
             lines.append(f"\n… показаны первые {len(shown)} из {len(matched)}.")
+        await update.message.reply_text("\n".join(lines))
+
+    async def week(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Current teaching week (utils/academic_calendar.py - Desae's own
+        request, not part of bro's ТЗ): one lab + one practice per course
+        per teaching week, so the week number IS the lab/practice number.
+        Lists it per real course when SSO course data is available
+        (self.db.get_latest_sso_semester_id()/get_sso_courses()), falls
+        back to a bare week number when it isn't (SSO Agent hasn't run
+        yet - this command still works either way, since the week
+        calculation itself doesn't depend on SSO data at all).
+        """
+        today = today_in_kz()
+        week1_start = self.config.semester1_week1_start.date()
+
+        if today < week1_start:
+            await update.message.reply_text(
+                f"Семестр ещё не начался — старт {week1_start.isoformat()}."
+            )
+            return
+
+        current = current_teaching_week(today, week1_start)
+        if current is None:
+            await update.message.reply_text(
+                f"Учебные недели закончились ({TOTAL_TEACHING_WEEKS} из {TOTAL_TEACHING_WEEKS}) "
+                "— похоже, сейчас сессия или каникулы."
+            )
+            return
+
+        start, end = teaching_week_bounds(current, week1_start)
+        lines = [
+            f"\U0001f4c6 Учебная неделя: {current} из {TOTAL_TEACHING_WEEKS} "
+            f"({start.isoformat()} – {end.isoformat()})"
+        ]
+        if current == FIRST_ATTESTATION_WEEK:
+            lines.append(
+                f"\U0001f4dd 1-я аттестация: к этой неделе — {current} практик и "
+                f"{current} лабораторных по каждому курсу."
+            )
+
+        semester_id = self.db.get_latest_sso_semester_id()
+        courses = self.db.get_sso_courses(semester_id) if semester_id is not None else []
+        if courses:
+            lines.append(f"\nНа этой неделе (по каждому курсу — лаба №{current}, практика №{current}):")
+            lines.extend(f"• [{c['code']}] {c['title']}" for c in courses)
+        else:
+            lines.append(
+                f"\nНа этой неделе — лаба №{current}, практика №{current} по каждому курсу "
+                "(список курсов пока недоступен — SSO Agent ещё не запускался)."
+            )
+
         await update.message.reply_text("\n".join(lines))
 
     async def briefing(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

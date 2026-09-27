@@ -49,6 +49,7 @@ class TelegramBot:
             "store": self.handlers.store,
             "schedule": self.handlers.schedule,
             "umkd": self.handlers.umkd,
+            "week": self.handlers.week,
             "briefing": self.handlers.briefing,
             "wishlist": self.handlers.wishlist_cmd,
             "addskin": self.handlers.addskin,
