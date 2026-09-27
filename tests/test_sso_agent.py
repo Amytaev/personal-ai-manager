@@ -6,7 +6,7 @@ import pytest
 
 from agents.base import AgentStatus
 from agents.sso.agent import SsoAgent
-from agents.sso.auth import API_BASE, STUD_BASE
+from agents.sso.auth import API_BASE, STUD_BASE, SsoAutofillLoginFailed
 
 _SEMESTERS_URL = f"{STUD_BASE}/api/ScheduleTable/GetCurrentAndAvailableSemesters"
 _DISCIPLINES_URL = f"{STUD_BASE}/api/ScheduleTable/GetDesciplines"
@@ -34,7 +34,13 @@ class _Env:
     reports.
     """
 
-    def __init__(self, responses: dict[str, object] | None = None, logged_in: bool = True):
+    def __init__(
+        self,
+        responses: dict[str, object] | None = None,
+        logged_in: bool = True,
+        autofill_succeeds: bool = False,
+        autofill_error: str = "saved credentials are stale",
+    ):
         self.responses = responses or {}
 
         self.page = MagicMock()
@@ -53,6 +59,14 @@ class _Env:
         self.session._ensure_context = AsyncMock(return_value=self.context)
         self.session.is_logged_in = AsyncMock(return_value=logged_in)
         self.session.close = AsyncMock()
+        # agents/sso/agent.py tries login_via_autofill() automatically
+        # before giving up with NeedsReauth - autofill_succeeds controls
+        # which of those two paths a "not logged in" test exercises.
+        self.session.login_via_autofill = AsyncMock()
+        if autofill_succeeds:
+            self.session.login_via_autofill.return_value = True
+        else:
+            self.session.login_via_autofill.side_effect = SsoAutofillLoginFailed(autofill_error)
 
     async def _get(self, url, timeout=None):
         if url in self.responses:
@@ -155,8 +169,8 @@ async def test_run_reports_working_and_saves_the_full_snapshot(tmp_db):
 
 
 @pytest.mark.asyncio
-async def test_run_reports_needs_reauth_when_session_is_not_logged_in(tmp_db):
-    env = _Env(responses=_full_responses(), logged_in=False)
+async def test_run_reports_needs_reauth_when_not_logged_in_and_autofill_also_fails(tmp_db):
+    env = _Env(responses=_full_responses(), logged_in=False, autofill_succeeds=False)
     agent = SsoAgent(profile_dir="unused", db=tmp_db, session=env.session)
 
     result = await agent.run()
@@ -164,10 +178,45 @@ async def test_run_reports_needs_reauth_when_session_is_not_logged_in(tmp_db):
     assert result.status == AgentStatus.FAILING
     assert result.data["needs_reauth"] is True
     assert "sso_login_setup" in result.error
+    # The automatic autofill re-auth is tried FIRST, before falling back
+    # to telling the person to log in by hand.
+    env.session.login_via_autofill.assert_awaited_once()
 
     with tmp_db.connect() as conn:
         count = conn.execute("SELECT COUNT(*) AS c FROM sso_courses").fetchone()["c"]
     assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_run_recovers_automatically_via_autofill_when_session_expired(tmp_db, monkeypatch):
+    # login_via_autofill() defaults to a headed context - switching back
+    # to headless afterward has a short real asyncio.sleep(3) in
+    # agents/sso/agent.py to avoid a cookie-flush race; mocked out here
+    # so this test doesn't actually wait 3 real seconds.
+    monkeypatch.setattr("agents.sso.agent.asyncio.sleep", AsyncMock())
+    env = _Env(responses=_full_responses(), logged_in=False, autofill_succeeds=True)
+    agent = SsoAgent(profile_dir="unused", db=tmp_db, session=env.session)
+
+    result = await agent.run()
+
+    assert result.status == AgentStatus.WORKING
+    assert result.data["needs_reauth"] is False
+    assert result.data["semester_id"] == 85
+    env.session.login_via_autofill.assert_awaited_once()
+
+    with tmp_db.connect() as conn:
+        count = conn.execute("SELECT COUNT(*) AS c FROM sso_courses").fetchone()["c"]
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_attempt_autofill_when_already_logged_in(tmp_db):
+    env = _Env(responses=_full_responses(), logged_in=True)
+    agent = SsoAgent(profile_dir="unused", db=tmp_db, session=env.session)
+
+    await agent.run()
+
+    env.session.login_via_autofill.assert_not_awaited()
 
 
 @pytest.mark.asyncio

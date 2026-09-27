@@ -25,11 +25,12 @@ all - see agents/sso/parser.py's docstring for why.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from urllib.parse import quote
 
 from agents.base import AgentResult, AgentStatus, BaseAgent
-from agents.sso.auth import API_BASE, SCHEDULE_PAGE_URL, STUD_BASE, SsoSession
+from agents.sso.auth import API_BASE, SCHEDULE_PAGE_URL, STUD_BASE, SsoAutofillLoginFailed, SsoSession
 from agents.sso.parser import (
     build_umkd_path_by_folder_id,
     iter_umkd_leaf_folders,
@@ -104,10 +105,38 @@ class SsoAgent(BaseAgent):
             await page.close()
 
         if not await self.session.is_logged_in():
-            raise NeedsReauth(
-                "SSO session looks expired - Auth/IsAuthenticated did not report a logged-in "
-                "session. Run scripts/sso_login_setup.py to log back in."
+            # Desae confirmed live (2026-09-27, scripts/sso_test_autofill_login.py)
+            # that Chromium's own saved-password autofill can recover a
+            # session on its own - try that FIRST, automatically, before
+            # falling back to the manual scripts/sso_login_setup.py flow
+            # run.py's NeedsReauth notification points to. A captcha,
+            # SMS code, 2FA, or a genuinely changed password will still
+            # make login_via_autofill() fail exactly like a real expired
+            # session would - there's no programmatic way around those,
+            # so NeedsReauth is still the real fallback, not removed.
+            logger.info(
+                "SSO agent: session looks expired - attempting automatic re-auth via the "
+                "browser's saved password before giving up..."
             )
+            try:
+                await self.session.login_via_autofill()
+            except SsoAutofillLoginFailed as exc:
+                raise NeedsReauth(
+                    f"SSO session expired and automatic autofill re-auth also failed ({exc}). "
+                    "Run scripts/sso_login_setup.py to log back in."
+                ) from exc
+
+            logger.info("SSO agent: automatic re-auth succeeded.")
+            # login_via_autofill() defaults to a HEADED context (see its
+            # docstring - autofill is confirmed real but headless-
+            # suppressed here) - switching back to headless for the
+            # actual data fetch below is the same close/reopen sequence
+            # that needed a short pause elsewhere in this project to
+            # reliably avoid a cookie-flush race (see auth.py's and
+            # scripts/sso_login_setup.py's history), so the same pause
+            # is applied here before re-acquiring the headless context.
+            await asyncio.sleep(3)
+            context = await self.session._ensure_context(headless=True)  # noqa: SLF001 - see auth.py
 
         raw_semesters = await self._get_json(context, _SEMESTERS_URL)
         semester_id = pick_current_semester_id(raw_semesters)
