@@ -27,8 +27,11 @@ What it does, in order:
      in THIS terminal once you're looking at a page that's clearly
      "inside" the student portal (schedule, УМКД, dashboard, whatever it
      actually shows you).
-  3. Reports the final URL and which domains your cookies ended up on
-     (names only - never values, a cookie value is a live credential).
+  3. Reports the final URL and which domains your cookies ended up on,
+     plus each relevant cookie's expiry metadata - SESSION (no
+     Expires/Max-Age, dropped whenever the browser process restarts) vs.
+     persistent (a real future expiry timestamp) - names/domains/expiry
+     only, never values, a cookie value is a live credential.
   4. Immediately reopens the SAME profile in HEADLESS mode (like a real
      scheduled agent would use) and checks, honestly this time - using
      page.wait_for_load_state("networkidle") before reading the URL,
@@ -44,6 +47,7 @@ line of SSO Agent code.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 from playwright.async_api import async_playwright
 
@@ -56,12 +60,26 @@ PROFILE_DIR = "data/sso_browser_profile"
 _RELEVANT_DOMAIN_SUBSTRINGS = ("satbayev.university", "microsoftonline.com", "microsoft.com", "live.com")
 
 
+def _expiry_label(cookie: dict) -> str:
+    """Playwright's cookie.expires is -1 for a real session-only cookie
+    (no Expires/Max-Age at all - the browser is free to drop it whenever
+    it likes, including "browser process restarted", which is exactly
+    what happens between this script's headed and headless contexts) or
+    a Unix timestamp for a persistent one. This is metadata about the
+    cookie's lifetime, not the cookie's value - safe to print."""
+    expires = cookie.get("expires")
+    if expires is None or expires == -1:
+        return "SESSION (dropped on browser restart)"
+    return f"persistent (expires {datetime.fromtimestamp(expires, tz=timezone.utc).isoformat()})"
+
+
 def _print_cookie_summary(cookies: list[dict], label: str) -> None:
     relevant = [c for c in cookies if any(sub in c.get("domain", "") for sub in _RELEVANT_DOMAIN_SUBSTRINGS)]
     print(f"\n{label} - {len(relevant)} relevant cookie(s):")
     for c in relevant:
-        # Name + domain only - NEVER the value, that's a live session credential.
-        print(f"  - {c.get('name')} @ {c.get('domain')}")
+        # Name + domain + expiry metadata only - NEVER the value, that's
+        # a live session credential.
+        print(f"  - {c.get('name')} @ {c.get('domain')} - {_expiry_label(c)}")
 
 
 async def main() -> None:
