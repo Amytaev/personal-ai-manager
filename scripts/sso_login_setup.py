@@ -114,7 +114,13 @@ def _inspect_cookie_db_on_disk(profile_dir: str) -> None:
         return
     print(f"  Found: {db_path}")
     try:
-        conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=5)
+        # sqlite3's URI mode needs an ABSOLUTE file: URI - a relative one
+        # (what db_path.as_posix() gives here, since PROFILE_DIR itself
+        # is relative) reliably fails to open on Windows with exactly
+        # "unable to open database file", which is what a first real run
+        # of this hit - Path.resolve().as_uri() is the fix.
+        uri = db_path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
         conn.row_factory = sqlite3.Row
         placeholders = ",".join("?" for _ in _COOKIE_NAMES_TO_CHECK)
         rows = conn.execute(
