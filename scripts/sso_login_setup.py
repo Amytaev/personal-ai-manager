@@ -47,12 +47,21 @@ line of SSO Agent code.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 from playwright.async_api import async_playwright
 
 SSO_URL = "https://sso.satbayev.university/"
 PROFILE_DIR = "data/sso_browser_profile"
+
+# Chromium's on-disk cookie store moved from Default/Cookies to
+# Default/Network/Cookies in newer versions (network-service split) -
+# try both rather than guess which one Playwright's bundled Chromium
+# uses.
+_COOKIE_DB_CANDIDATES = ("Default/Network/Cookies", "Default/Cookies")
+_COOKIE_NAMES_TO_CHECK = ("kaznitu.auth.cookie", "__RequestVerificationToken", "_culture")
 
 # Cookie/domain names worth reporting - broadened to anything under
 # satbayev.university plus the usual Microsoft/Azure AD domains, since we
@@ -82,6 +91,51 @@ def _print_cookie_summary(cookies: list[dict], label: str) -> None:
         print(f"  - {c.get('name')} @ {c.get('domain')} - {_expiry_label(c)}")
 
 
+def _inspect_cookie_db_on_disk(profile_dir: str) -> None:
+    """Reads Chromium's own cookie SQLite file directly, bypassing
+    Playwright's API entirely - the decisive check for "did the cookie
+    actually make it to disk at all", separate from "does a freshly
+    launched context load/send it". kaznitu.auth.cookie showed up with a
+    real future expiry (not -1/SESSION) in the headed context.cookies()
+    read, which rules out the plain session-cookie theory - so the next
+    question is whether it was ever written to disk in the first place,
+    or written but not loaded/sent back by the very next launch. Prints
+    is_persistent/has_expires/expires_utc metadata only - the row's
+    value/encrypted_value columns are never read or printed, those are
+    live credential material."""
+    db_path = next(
+        (p for p in (Path(profile_dir) / c for c in _COOKIE_DB_CANDIDATES) if p.exists()),
+        None,
+    )
+    print("\nInspecting the on-disk cookie store directly (bypassing Playwright's API)...")
+    if db_path is None:
+        tried = [str(Path(profile_dir) / c) for c in _COOKIE_DB_CANDIDATES]
+        print(f"  No cookie SQLite file found - tried: {tried}")
+        return
+    print(f"  Found: {db_path}")
+    try:
+        conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        placeholders = ",".join("?" for _ in _COOKIE_NAMES_TO_CHECK)
+        rows = conn.execute(
+            f"SELECT host_key, name, is_persistent, has_expires, expires_utc "
+            f"FROM cookies WHERE name IN ({placeholders})",
+            _COOKIE_NAMES_TO_CHECK,
+        ).fetchall()
+        conn.close()
+    except Exception as exc:  # noqa: BLE001 - a diagnostic read failing shouldn't crash the whole script
+        print(f"  Could not read the cookie DB directly: {exc!r}")
+        return
+    if not rows:
+        print("  No matching rows in the on-disk store at all (not even _culture).")
+        return
+    for row in rows:
+        print(
+            f"  - {row['name']} @ {row['host_key']} - is_persistent={row['is_persistent']} "
+            f"has_expires={row['has_expires']} expires_utc_raw={row['expires_utc']}"
+        )
+
+
 async def main() -> None:
     print(f"Using a fresh, separate browser profile at: {PROFILE_DIR}")
     print(f"Opening {SSO_URL} in a real, visible window - please sign in by hand.\n")
@@ -108,6 +162,16 @@ async def main() -> None:
 
         await page.close()
         await headed_context.close()
+
+        _inspect_cookie_db_on_disk(PROFILE_DIR)
+
+        # A short pause here rules out a cheap-but-real alternative
+        # explanation: Chromium/the OS not having fully released its
+        # file lock on the just-closed profile's cookie DB before the
+        # very next launch tries to read it (more of a risk on Windows
+        # than Linux, where file locking is stricter).
+        print("\nWaiting 3s before reopening, to rule out a file-lock/timing race...")
+        await asyncio.sleep(3)
 
         print(
             "\nReopening the same profile headless (like a real scheduled agent would) and "
@@ -140,9 +204,10 @@ async def main() -> None:
         await headless_context.close()
 
     print(
-        "\nDone. Send back: the final URL after manual login, the headless final URL, "
-        "whether they match, and the cookie domain/name lists above (no values) - that's "
-        "the real first-hand answer on whether SSO has the same headless problem as Teams."
+        "\nDone. Send back everything above: the final URL after manual login, the "
+        "on-disk cookie store rows, the headless final URL, whether it matches, and the "
+        "cookie domain/name/expiry lists (no values) - together they show whether the "
+        "cookie ever reaches disk at all, or reaches disk but isn't loaded/sent back."
     )
 
 
