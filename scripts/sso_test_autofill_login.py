@@ -23,9 +23,19 @@ Run it yourself:
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 from agents.sso.auth import SsoAutofillLoginFailed, SsoSession
+
+# A real run (2026-09-27, Windows) lost every print() between "before:
+# False" and a crash - the process died abruptly enough (browser context
+# gone, then an asyncio subprocess-transport deallocation error on top)
+# that Windows' default block-buffered stdout never got flushed, so the
+# actual failure point was invisible - only session.close()'s own
+# follow-on error surfaced. Forcing line buffering here means every
+# print below is on disk/screen the instant it runs, crash or not.
+sys.stdout.reconfigure(line_buffering=True)
 
 PROFILE_DIR = "data/sso_browser_profile"
 
@@ -65,6 +75,10 @@ async def main() -> None:
             print("login_via_autofill(): succeeded (Auth/IsAuthenticated confirmed true).")
         except SsoAutofillLoginFailed as exc:
             print(f"login_via_autofill(): FAILED - {exc}")
+        except Exception as exc:  # noqa: BLE001 - see this module's docstring/comment above: a real prior
+            # run raised something OTHER than SsoAutofillLoginFailed and the real error got
+            # masked - this is the fallback that guarantees it's visible instead, whatever it is.
+            print(f"login_via_autofill(): UNEXPECTED {type(exc).__name__}: {exc!r}")
 
         after = await session.is_logged_in()
         print(f"is_logged_in() after autofill login: {after}")

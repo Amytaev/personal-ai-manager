@@ -39,6 +39,7 @@ import logging
 from pathlib import Path
 
 from playwright.async_api import BrowserContext, async_playwright
+from playwright.async_api import Error as PlaywrightError
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +125,20 @@ class SsoSession:
 
     async def close(self) -> None:
         if self._context is not None:
-            await self._context.close()
+            try:
+                await self._context.close()
+            except PlaywrightError as exc:
+                # Real failure mode hit live (2026-09-27, login_via_autofill()
+                # testing on Windows): the underlying Chromium process/context
+                # can already be gone by the time we get here (crashed, or
+                # torn down by something outside our control) - "Target page,
+                # context or browser has been closed" from OUR OWN close()
+                # call then masked whatever raised first, since it happened
+                # inside a bare `finally: await session.close()` with no
+                # handling for this. Swallow it here (there's nothing left to
+                # close) so the REAL originating error - not this follow-on
+                # one - is what callers actually see.
+                logger.warning("SSO context was already closed when close() was called: %s", exc)
             self._context = None
             self._context_headless = None
         if self._playwright is not None:
@@ -260,7 +274,22 @@ class SsoSession:
                     "this profile, or Chromium's local password manager didn't fill it in time."
                 ) from exc
 
-            await page.locator("button:has-text('войти')").first.click(timeout=5_000)
+            try:
+                await page.locator("button:has-text('войти')").first.click(timeout=5_000)
+            except PlaywrightError as exc:
+                # Real failure hit live (2026-09-27): the underlying
+                # browser context can die mid-click (crash, or the click
+                # triggering a navigation the context doesn't survive) -
+                # previously this propagated as a raw Playwright error
+                # that wasn't SsoAutofillLoginFailed, so the caller's
+                # `except SsoAutofillLoginFailed` never caught it and the
+                # REAL error got masked by session.close() failing
+                # afterwards on the already-dead context. Wrapping it
+                # here means callers only ever see one clear exception
+                # type from this method, with the real cause attached.
+                raise SsoAutofillLoginFailed(
+                    f"Browser context failed during/after the login click: {exc!r}"
+                ) from exc
 
             if not await self.is_logged_in():
                 raise SsoAutofillLoginFailed(
@@ -270,4 +299,7 @@ class SsoSession:
             logger.info("SSO autofill login succeeded (profile: %s).", self.profile_dir)
             return True
         finally:
-            await page.close()
+            try:
+                await page.close()
+            except PlaywrightError as exc:
+                logger.warning("SSO page was already closed during cleanup: %s", exc)
