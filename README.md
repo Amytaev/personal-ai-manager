@@ -3,16 +3,22 @@
 Локальная система персональной автоматизации (Teams / Weather / VALORANT →
 AI Manager → Telegram). Полное ТЗ см. `TZ_v4.md` (хранится отдельно).
 
-**Текущее состояние: Этап B — SSO Agent (Schedule + UMKD) добавлен поверх
-Phase 6.3, плюс `/schedule`/`/umkd`/`/week` в Telegram-боте.** Teams
-Agent (Phase 5), VALORANT Agent (Phase 6) и теперь SSO Agent (bro's ТЗ,
-Этап A/B) все реализованы и подключены в `run.py`, `/store` в Telegram
-показывает реальные скины с картинками, `/schedule`/`/umkd` показывают
-уже собранные SSO-данные, `/week` — личная (не из ТЗ бро) команда,
-считающая текущую учебную неделю и номер лабы/практики, а протухшая
-сессия (Teams, Stack B или SSO) шлёт отдельное Telegram-уведомление
-вместо тихого падения. Study Manager, Checker Agent, Auth Checker Agent
-и Telegram Mini App из bro's ТЗ остаются нетронутыми — следующий шаг.
+**Текущее состояние: Auth Checker Agent добавлен поверх Этапа B (SSO
+Agent + автологин).** Teams Agent (Phase 5), VALORANT Agent (Phase 6),
+SSO Agent (bro's ТЗ, Этап A/B) и теперь Auth Checker Agent (bro's ТЗ,
+следующий слой архитектуры) все реализованы и подключены в `run.py`,
+`/store` в Telegram показывает реальные скины с картинками,
+`/schedule`/`/umkd` показывают уже собранные SSO-данные, `/week` —
+личная (не из ТЗ бро) команда, считающая текущую учебную неделю и
+номер лабы/практики, а протухшая сессия (Teams, Stack B или SSO) шлёт
+отдельное Telegram-уведомление вместо тихого падения. Auth Checker
+теперь параллельно ведёт единый `source_status` health-report (Teams +
+SSO: `OK`/`AUTH_REQUIRED`/`ERROR`/`UNAVAILABLE`/`UNKNOWN`) для будущего
+Study Manager — без Telegram-команды пока, это ещё не Checker/Study
+Manager. Checker (сопоставление расписания SSO с заданиями Teams),
+Study Manager и Telegram Mini App из bro's ТЗ остаются нетронутыми —
+следующий шаг, именно в таком порядке (Auth Checker → Checker → Study
+Manager).
 
 ## Что уже есть
 
@@ -27,6 +33,7 @@ Agent (Phase 5), VALORANT Agent (Phase 6) и теперь SSO Agent (bro's ТЗ,
 | Парсер магазина Stack B → skin rows + VALORANT Agent (полный цикл run()) | `agents/valorant/parser.py`, `agents/valorant/agent.py` | ✅ Phase 6, реальные данные подтверждены |
 | Диагностические скрипты (вход/захват трафика) | `scripts/teams_login_setup.py`, `scripts/teams_capture_assignments.py`, `scripts/valorant_login_setup.py`, `scripts/valorant_capture_store.py`, `scripts/sso_login_setup.py`, `scripts/sso_check_portal_access.py`, `scripts/sso_capture_data.py` | ✅ готовы к запуску пользователем |
 | **SSO/УМКД — чистый JSON API, никакого HTML-парсинга** | `agents/sso/auth.py`, `agents/sso/parser.py`, `agents/sso/agent.py` | ✅ Этап B, реальные данные подтверждены (см. раздел ниже) |
+| **Auth Checker Agent** — единый `source_status` health-check (Teams + SSO) | `agents/auth_checker.py`, `storage/models.py` (`source_status`) | ✅ bro's ТЗ, следующий слой архитектуры (см. раздел ниже) |
 
 ## Phase 1 → Phase 5: закрытый вопрос про Graph API
 
@@ -852,9 +859,75 @@ Chromium** — это не баг, это прямое следствие тог
 Раньше это была цена только ручных диагностических прогонов; теперь
 это цена и обычного фонового цикла.
 
+## Auth Checker Agent — единый health-check поверх Teams + SSO (bro's ТЗ)
+
+`agents/auth_checker.py` — не source-агент: он ничего не собирает и не
+трогает `tasks`/`sso_courses`/`sso_schedule_entries`/
+`sso_study_materials`. Единственная задача — раз в
+`AUTH_CHECKER_INTERVAL_MINUTES` (по умолчанию 30, дешевле обычного
+синка, т.к. это просто `is_logged_in()`, без логина и без фетча
+данных) спросить у Teams- и SSO-сессий их реальный статус и записать в
+новую таблицу `source_status` (`storage/models.py`) один из пяти
+статусов:
+
+- `OK` — `is_logged_in()` подтвердил валидную сессию.
+- `AUTH_REQUIRED` — сессия протухла (ожидаемое состояние, не баг).
+- `ERROR` — сама проверка упала с исключением (сеть, краш браузера) —
+  это НЕ то же самое, что подтверждённый разлогин.
+- `UNAVAILABLE` — для этого источника в данном запуске вообще не была
+  передана сессия.
+- `UNKNOWN` — зарезервировано на будущее, `_check_source()` сегодня его
+  никогда не возвращает.
+
+`storage/database.py`'s `record_source_status()`/`get_source_status()`/
+`get_all_source_status()` — единая точка, которую позже сможет
+запросить Study Manager, не разбираясь в деталях Teams/SSO/Auth
+Checker. `last_successful_sync` двигается вперёд только на реальном
+`OK` — упавшая проверка его не затирает, так что "когда это последний
+раз реально работало" переживает временный сбой источника.
+`last_error` хранит последнюю НЕ-`None` ошибку и не стирается чистым
+`OK` — восстановившийся источник всё ещё может сказать, что именно
+сломалось в прошлый раз.
+
+**Почему сессии общие с `TeamsAgent`/`SsoAgent`, а не свои** —
+`TeamsSession`/`SsoSession` прямо документированы как "только один
+процесс Chromium может использовать данный `profile_dir` одновременно"
+(`agents/teams/auth.py`, `agents/sso/auth.py`). Второй независимый
+`TeamsSession`/`SsoSession` на тот же `profile_dir` дрался бы с
+настоящим агентом за лок персистентного профиля. Поэтому `run.py`
+теперь сам создаёт `TeamsSession`/`SsoSession` и передаёт ОДИН и тот же
+инстанс и в `TeamsAgent(session=...)`/`SsoAgent(session=...)`, и в
+`AuthCheckerAgent` — `Auth Checker` вызывает на них только
+`is_logged_in()` (лёгкое чтение), никогда не открывает контекст сам,
+так что делить инстанс безопасно. Следствие: `teams_agent.aclose()`/
+`sso_agent.aclose()` теперь no-op (`_owns_session=False`), закрытие
+этих двух общих сессий при остановке — забота самого `run.py`.
+
+Явно НЕ делает (bro's ТЗ, пункты 6/7/9/10):
+
+- Не запускает `login_interactively()`/`login_via_autofill()` сам —
+  восстановление сессии остаётся ответственностью владеющего
+  source-агента (SSO Agent уже сам пробует автологин, см. раздел выше).
+- Не судит о здоровье источника по количеству данных в БД — пустой
+  результат не признак разлогина, единственный сигнал — реальный
+  `is_logged_in()`.
+- Не удаляет и не трогает никакие другие таблицы — временный
+  `AUTH_REQUIRED`/`ERROR` никогда не должен обрушить уже собранные
+  `/tasks`, `/schedule`, `/umkd`.
+- Не хранит пароль, cookie, access token или MFA-код — только статус,
+  два ISO-таймстампа и короткое сообщение исключения.
+
+Без отдельной Telegram-команды пока — `run.py` просто ведёт
+`source_status` в фоне (первый прогон сразу при старте, плюс каждые
+`AUTH_CHECKER_INTERVAL_MINUTES`), без отдельного Telegram-уведомления
+на `AUTH_REQUIRED`/`ERROR` — тот же самый сбой уже подтверждается
+существующим `needs_reauth`-уведомлением от `_teams_cycle`/`_sso_cycle`
+при первом реальном синке, второе уведомление о том же событии было бы
+просто шумом.
+
 ## Тесты
 
-**197 тестов, все проходят**: 56 из Phase 2-4 (core infra, БД,
+**209 тестов, все проходят**: 56 из Phase 2-4 (core infra, БД,
 scheduler/retry, Weather Agent, Telegram auth/wishlist, LLM provider —
 включая 4 для чата с Claude, `Handlers.chat`) + 43 из Phase 5 (18 для
 Teams-парсера, 8 для `TeamsSession` (включая 2 на исправленный
@@ -960,6 +1033,20 @@ true/false по реальному ответу `Auth/IsAuthenticated`, не-JSO
   `reply_media_group`), предупреждение первым сообщением, когда
   последний прогон `ValorantAgent` упал, но старые данные в БД всё
   равно показываются.
+- `tests/test_auth_checker.py` (**6 новых**) — `AuthCheckerAgent.run()`
+  на замоканных `is_logged_in()`: `OK` для обоих источников, `AUTH_REQUIRED`
+  когда сессия протухла (при этом `AgentResult.status` остаётся
+  `WORKING` — это ожидаемое состояние, не баг), `ERROR` + `DEGRADED`
+  когда сама проверка бросила исключение (и что сбой одного источника
+  не портит статус другого), `UNAVAILABLE`, когда сессия вообще не
+  передана, что `login_interactively()`/`login_via_autofill()` ни разу
+  не вызываются, и что у `SourceStatus` ровно 5 значений.
+- `tests/test_database.py` (**6 новых**) — `record_source_status()`/
+  `get_source_status()`/`get_all_source_status()`: пусто до первой
+  проверки, `OK` выставляет `last_successful_sync`, повторная запись
+  того же источника апсертит на месте, упавшая проверка НЕ затирает
+  предыдущий `last_successful_sync`, чистый `OK` НЕ стирает
+  `last_error` от прошлого сбоя, сортировка по `source`.
 
 Реальный браузер в тестах не запускается и не нужен нигде — вся
 логика Teams Agent и VALORANT Agent (парсинг, дедупликация,

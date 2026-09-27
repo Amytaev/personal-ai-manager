@@ -23,6 +23,7 @@ def _config(tmp_path) -> AppConfig:
         weather_interval_minutes=60,
         valorant_interval_minutes=120,
         sso_interval_minutes=120,
+        auth_checker_interval_minutes=30,
         briefing_hour=8,
         included_courses=(),
         excluded_courses=(),

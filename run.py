@@ -1,15 +1,18 @@
-"""Entrypoint (+ SSO Agent (Этап B) on top of Phase 6's VALORANT Agent,
-Phase 5's Teams Agent, Phase 4's Core Infrastructure + Telegram Bot +
-Weather Agent).
+"""Entrypoint (+ Auth Checker Agent on top of the SSO Agent (Этап B),
+Phase 6's VALORANT Agent, Phase 5's Teams Agent, Phase 4's Core
+Infrastructure + Telegram Bot + Weather Agent).
 
 Wires together config, logging, the single-instance guard, the SQLite
 database, the scheduler, the Telegram bot, and the Weather/Teams/
-VALORANT/SSO agents. The AI Manager that would aggregate/prioritize/
-summarize everything is still Phase 7 - /weather, /tasks, /store and
-/briefing now all show real data once the relevant agent has run at
-least once. SSO Agent data (normalized schedule/УМКД) has no bot
+VALORANT/SSO/Auth Checker agents. The AI Manager that would aggregate/
+prioritize/summarize everything is still Phase 7 - /weather, /tasks,
+/store and /briefing now all show real data once the relevant agent has
+run at least once. SSO Agent data (normalized schedule/УМКД) has no bot
 command of its own yet - that's Study Manager/Mini App territory,
-explicitly out of scope for this stage.
+explicitly out of scope for this stage. Auth Checker only maintains
+storage/models.py's source_status table (agents/auth_checker.py) for a
+future Study Manager/health report to read - it has no bot command of
+its own either.
 """
 from __future__ import annotations
 
@@ -18,9 +21,12 @@ import json
 import logging
 import signal
 
+from agents.auth_checker import AuthCheckerAgent
 from agents.runner import run_and_record
 from agents.sso.agent import SsoAgent
+from agents.sso.auth import SsoSession
 from agents.teams.agent import TeamsAgent
+from agents.teams.auth import TeamsSession
 from agents.valorant.agent import ValorantAgent
 from agents.weather import WeatherAgent
 from config import load_config
@@ -104,6 +110,17 @@ async def _valorant_cycle(agent: ValorantAgent, db: Database, bot: TelegramBot |
         )
 
 
+async def _auth_checker_cycle(agent: AuthCheckerAgent, db: Database) -> None:
+    # No Telegram notification here on purpose - AUTH_REQUIRED/ERROR for
+    # a source is already surfaced by that source's own _teams_cycle/
+    # _sso_cycle needs_reauth notification above, the first time its OWN
+    # sync actually hits the problem. Auth Checker's job (bro's ТЗ) is
+    # only to keep source_status current for a future health/status
+    # report - duplicating the same alert from a second place would just
+    # be redundant noise on the same underlying event.
+    await run_and_record(agent, db)
+
+
 async def _sso_cycle(agent: SsoAgent, db: Database, bot: TelegramBot | None) -> None:
     # Unlike _weather_cycle, SsoAgent.run() already writes its own rows
     # (storage/database.py's save_sso_snapshot) as part of run() itself,
@@ -142,6 +159,19 @@ async def main() -> None:
     teams_agent: TeamsAgent | None = None
     valorant_agent: ValorantAgent | None = None
     sso_agent: SsoAgent | None = None
+    auth_checker_agent: AuthCheckerAgent | None = None
+    # Constructed here (not left for TeamsAgent/SsoAgent's own
+    # session-or-None default) SPECIFICALLY so the same instances can
+    # also be handed to AuthCheckerAgent below - both TeamsSession and
+    # SsoSession are documented as "only one Chromium process may use a
+    # given profile_dir at a time" (agents/teams/auth.py, agents/sso/
+    # auth.py), so a second, independent session on the same profile_dir
+    # would fight the real agent for that persistent profile's lock.
+    # run.py owns these now (teams_agent/sso_agent's own _owns_session
+    # becomes False), so they're closed in the finally block below
+    # instead of by teams_agent.aclose()/sso_agent.aclose().
+    teams_session = TeamsSession(config.teams_profile_path)
+    sso_session = SsoSession(config.sso_profile_path)
 
     # Everything from here on is inside one try/finally so that a failure
     # at ANY startup step (scheduler, the Telegram bot failing to reach
@@ -174,6 +204,7 @@ async def main() -> None:
         teams_agent = TeamsAgent(
             profile_dir=config.teams_profile_path,
             db=db,
+            session=teams_session,
             min_due_date=config.teams_min_due_date,
         )
         scheduler.register(
@@ -209,11 +240,28 @@ async def main() -> None:
         sso_agent = SsoAgent(
             profile_dir=config.sso_profile_path,
             db=db,
+            session=sso_session,
         )
         scheduler.register(
             job_id="sso_check",
             interval_minutes=config.sso_interval_minutes,
             func=lambda: _sso_cycle(sso_agent, db, bot),
+        )
+
+        # Auth Checker Agent (bro's ТЗ) - shares teams_session/sso_session
+        # with the two agents above (see the comment where those are
+        # constructed), never opens a session of its own, and only ever
+        # calls is_logged_in() - no login, no data fetch. Checker/Study
+        # Manager/Mini App remain out of scope for this stage.
+        auth_checker_agent = AuthCheckerAgent(
+            db=db,
+            teams_session=teams_session,
+            sso_session=sso_session,
+        )
+        scheduler.register(
+            job_id="auth_checker_check",
+            interval_minutes=config.auth_checker_interval_minutes,
+            func=lambda: _auth_checker_cycle(auth_checker_agent, db),
         )
 
         scheduler.start()
@@ -260,6 +308,14 @@ async def main() -> None:
             # needs_reauth found on this very first run can still
             # trigger the Telegram notification right away.
             await _sso_cycle(sso_agent, db, bot)
+
+        if auth_checker_agent is not None:
+            # Same immediate-first-run rationale as the other agents
+            # above - runs after teams_agent/sso_agent's own first cycle
+            # so source_status reflects reality from the very first
+            # moment /status (or a future Study Manager) could ask for
+            # it, not just after the first scheduled interval elapses.
+            await _auth_checker_cycle(auth_checker_agent, db)
 
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -322,6 +378,20 @@ async def main() -> None:
                 await sso_agent.aclose()
             except Exception:  # noqa: BLE001 - best-effort cleanup boundary
                 logger.exception("Error while closing the SSO Agent's browser session")
+        # teams_agent.aclose()/sso_agent.aclose() above are no-ops now
+        # (session was injected, so _owns_session is False on both) -
+        # run.py itself owns teams_session/sso_session (constructed
+        # above so AuthCheckerAgent could share them), so it closes them
+        # here instead. AuthCheckerAgent itself never opens a session of
+        # its own and has no aclose() to call.
+        try:
+            await teams_session.close()
+        except Exception:  # noqa: BLE001 - best-effort cleanup boundary
+            logger.exception("Error while closing the shared Teams browser session")
+        try:
+            await sso_session.close()
+        except Exception:  # noqa: BLE001 - best-effort cleanup boundary
+            logger.exception("Error while closing the shared SSO browser session")
         try:
             await scheduler.shutdown(wait=True)
         except Exception:  # noqa: BLE001 - best-effort cleanup boundary

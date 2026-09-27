@@ -57,6 +57,7 @@ class AppConfig:
     weather_interval_minutes: int
     valorant_interval_minutes: int
     sso_interval_minutes: int
+    auth_checker_interval_minutes: int
     briefing_hour: int
 
     included_courses: tuple[str, ...]
@@ -92,6 +93,14 @@ def load_config() -> AppConfig:
         # for now; schedule/UMKD data changes far less often than an
         # assignment list, so this is deliberately not aggressive.
         sso_interval_minutes=_int_env("SSO_INTERVAL_MINUTES", 120),
+        # Auth Checker only ever does a lightweight is_logged_in() read
+        # (no login, no data fetch) on sessions the real source agents
+        # already own (see agents/auth_checker.py's docstring on session
+        # sharing) - cheap enough to run more often than the heavier
+        # Teams/SSO sync cycles above, so a stale session is flagged in
+        # source_status well before the next real sync would have
+        # noticed it on its own.
+        auth_checker_interval_minutes=_int_env("AUTH_CHECKER_INTERVAL_MINUTES", 30),
         briefing_hour=_int_env("BRIEFING_HOUR", 8),
         included_courses=_csv_env("INCLUDED_COURSES"),
         excluded_courses=_csv_env("EXCLUDED_COURSES"),

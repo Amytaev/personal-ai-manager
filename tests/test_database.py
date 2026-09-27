@@ -14,7 +14,7 @@ def test_schema_creates_all_required_tables(tmp_db):
 
     required = {
         "tasks", "weather_snapshots", "valorant_store", "notifications", "agent_runs",
-        "sso_courses", "sso_schedule_entries", "sso_study_materials",
+        "sso_courses", "sso_schedule_entries", "sso_study_materials", "source_status",
     }
     assert required.issubset(tables)
 
@@ -174,3 +174,67 @@ def test_cleanup_does_not_touch_tasks_or_notifications(tmp_db):
     assert tmp_db.was_notified("agent_status_change", "teams:failing") is True
     with tmp_db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()["c"] == 1
+
+
+# -- source_status (Auth Checker Agent) ------------------------------------
+
+def test_get_source_status_is_none_before_any_check(tmp_db):
+    assert tmp_db.get_source_status("teams") is None
+    assert tmp_db.get_all_source_status() == []
+
+
+def test_record_source_status_ok_stores_and_sets_last_successful_sync(tmp_db):
+    tmp_db.record_source_status("sso", "OK", "2026-09-28T00:00:00+00:00")
+
+    row = tmp_db.get_source_status("sso")
+    assert row["status"] == "OK"
+    assert row["checked_at"] == "2026-09-28T00:00:00+00:00"
+    assert row["last_successful_sync"] == "2026-09-28T00:00:00+00:00"
+    assert row["last_error"] is None
+
+
+def test_record_source_status_upserts_the_same_source_in_place(tmp_db):
+    tmp_db.record_source_status("teams", "OK", "2026-09-28T00:00:00+00:00")
+    tmp_db.record_source_status("teams", "AUTH_REQUIRED", "2026-09-28T01:00:00+00:00")
+
+    assert tmp_db.get_all_source_status() == tmp_db.get_all_source_status()  # sanity: stable read
+    rows = tmp_db.get_all_source_status()
+    assert len(rows) == 1
+    assert rows[0]["source"] == "teams"
+    assert rows[0]["status"] == "AUTH_REQUIRED"
+
+
+def test_record_source_status_keeps_last_successful_sync_when_a_later_check_fails(tmp_db):
+    tmp_db.record_source_status("teams", "OK", "2026-09-28T00:00:00+00:00")
+    tmp_db.record_source_status(
+        "teams", "ERROR", "2026-09-28T01:00:00+00:00", error="RuntimeError: network down"
+    )
+
+    row = tmp_db.get_source_status("teams")
+    assert row["status"] == "ERROR"
+    assert row["checked_at"] == "2026-09-28T01:00:00+00:00"
+    # Last known-good sync is NOT wiped just because the most recent check failed.
+    assert row["last_successful_sync"] == "2026-09-28T00:00:00+00:00"
+    assert row["last_error"] == "RuntimeError: network down"
+
+
+def test_record_source_status_keeps_last_error_after_a_clean_recovery(tmp_db):
+    tmp_db.record_source_status(
+        "sso", "ERROR", "2026-09-28T00:00:00+00:00", error="TimeoutError: boom"
+    )
+    tmp_db.record_source_status("sso", "OK", "2026-09-28T01:00:00+00:00")
+
+    row = tmp_db.get_source_status("sso")
+    assert row["status"] == "OK"
+    assert row["last_successful_sync"] == "2026-09-28T01:00:00+00:00"
+    # A clean OK check (error=None) does not erase the history of what
+    # broke last time - a recovered source can still say what happened.
+    assert row["last_error"] == "TimeoutError: boom"
+
+
+def test_get_all_source_status_orders_by_source(tmp_db):
+    tmp_db.record_source_status("sso", "OK", "2026-09-28T00:00:00+00:00")
+    tmp_db.record_source_status("teams", "OK", "2026-09-28T00:00:00+00:00")
+
+    sources = [row["source"] for row in tmp_db.get_all_source_status()]
+    assert sources == ["sso", "teams"]

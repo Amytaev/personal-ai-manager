@@ -256,6 +256,70 @@ class Database:
             ).fetchone()
             return row["semester_id"] if row and row["semester_id"] is not None else None
 
+    # -- source_status (Auth Checker Agent) -------------------------------
+
+    def record_source_status(
+        self,
+        source: str,
+        status: str,
+        checked_at: str,
+        error: str | None = None,
+    ) -> None:
+        """Upserts the live auth/health flag for one source (agents/
+        auth_checker.py). Two fields are deliberately NOT just "whatever
+        was passed this call":
+
+        - last_successful_sync only ever moves forward on status="OK" -
+          a later AUTH_REQUIRED/ERROR/UNAVAILABLE check reuses whatever
+          was already stored, so "when did this last actually work"
+          survives the source being temporarily down instead of getting
+          wiped to NULL/stale the moment it fails once.
+        - last_error keeps the most recent non-None ``error`` ever
+          passed for this source - a clean status="OK" call (error=None)
+          does not clear it, so a recovered source can still say what
+          broke last time instead of going silent about its own history.
+
+        Never pass anything password/cookie/token/MFA-shaped as
+        ``error`` - see this table's schema comment in storage/models.py.
+        """
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT last_successful_sync, last_error FROM source_status WHERE source = ?",
+                (source,),
+            ).fetchone()
+            last_successful_sync = existing["last_successful_sync"] if existing else None
+            if status == "OK":
+                last_successful_sync = checked_at
+            last_error = error if error is not None else (existing["last_error"] if existing else None)
+            conn.execute(
+                """
+                INSERT INTO source_status
+                    (source, status, checked_at, last_successful_sync, last_error)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(source) DO UPDATE SET
+                    status=excluded.status,
+                    checked_at=excluded.checked_at,
+                    last_successful_sync=excluded.last_successful_sync,
+                    last_error=excluded.last_error
+                """,
+                (source, status, checked_at, last_successful_sync, last_error),
+            )
+
+    def get_source_status(self, source: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM source_status WHERE source = ?", (source,)
+            ).fetchone()
+
+    def get_all_source_status(self) -> list[sqlite3.Row]:
+        """The single health/status report a future Study Manager (or a
+        Telegram /status extension) can read without knowing about
+        Teams/SSO/Auth Checker internals at all - just "what sources
+        exist and can their data currently be trusted" (bro's ТЗ, Auth
+        Checker Agent step, point 12)."""
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM source_status ORDER BY source").fetchall()
+
     # -- notifications (dedup, TZ v4 §20/§22) ----------------------------
 
     def was_notified(self, kind: str, dedupe_key: str) -> bool:

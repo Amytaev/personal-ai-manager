@@ -1,9 +1,9 @@
 """SQLite schema for the Personal AI Manager (TZ v4 §12).
 
 Tables: tasks, weather_snapshots, valorant_store, notifications,
-agent_runs, sso_courses, sso_schedule_entries, sso_study_materials.
-Retention/cleanup logic lives in storage/database.py, not here — this
-module only defines shape.
+agent_runs, sso_courses, sso_schedule_entries, sso_study_materials,
+source_status. Retention/cleanup logic lives in storage/database.py,
+not here — this module only defines shape.
 """
 from __future__ import annotations
 
@@ -108,6 +108,28 @@ CREATE TABLE IF NOT EXISTS sso_study_materials (
     course_title            TEXT,
     instructor_name         TEXT,
     updated_at              TEXT NOT NULL
+);
+
+-- Auth Checker Agent - one row per source, always upserted in place
+-- (PRIMARY KEY source, no history table): this is a live "can this
+-- source's data currently be trusted" flag, not an event log -
+-- agent_runs above already keeps the per-run history for every agent,
+-- including auth_checker's own runs. status is one of OK/AUTH_REQUIRED/
+-- ERROR/UNAVAILABLE/UNKNOWN (agents/auth_checker.py's SourceStatus).
+-- last_successful_sync is only ever bumped forward on a real OK check -
+-- a later AUTH_REQUIRED/ERROR check never overwrites it, so "when did
+-- this last actually work" survives a source being temporarily down.
+-- last_error is the most recent non-null error/detail seen for this
+-- source - never cleared automatically on recovery, so a briefing can
+-- still say "recovered, but here's what broke last time" - and, same
+-- as everywhere else in this project, this column must never hold a
+-- password, cookie, access token or MFA code.
+CREATE TABLE IF NOT EXISTS source_status (
+    source                  TEXT PRIMARY KEY,
+    status                  TEXT NOT NULL,
+    checked_at              TEXT NOT NULL,
+    last_successful_sync    TEXT,
+    last_error              TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_runs_agent_time ON agent_runs(agent, finished_at);
