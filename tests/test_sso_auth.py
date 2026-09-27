@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agents.sso.auth import IS_AUTHENTICATED_URL, SsoLoginTimeout, SsoSession
+from agents.sso.auth import IS_AUTHENTICATED_URL, SsoAutofillLoginFailed, SsoLoginTimeout, SsoSession
 
 
 def _fake_api_response(ok: bool, body):
@@ -157,6 +157,91 @@ async def test_reusing_same_headless_mode_does_not_recreate_context(tmp_path):
         await session.is_logged_in()
 
     assert mock_chromium.launch_persistent_context.await_count == 1
+
+
+def _wire_autofill_page(mock_page) -> None:
+    """login_via_autofill() calls page.wait_for_function() (awaited) and
+    page.locator(...).first.click() (locator() is a SYNC call in real
+    Playwright, only .click() is async) - _make_mock_playwright()'s
+    plain AsyncMock page doesn't shape those two correctly by default,
+    so tests using them wire this in first."""
+    mock_page.wait_for_function = AsyncMock()
+    mock_locator = MagicMock()
+    mock_locator.first = MagicMock()
+    mock_locator.first.click = AsyncMock()
+    mock_page.locator = MagicMock(return_value=mock_locator)
+
+
+@pytest.mark.asyncio
+async def test_login_via_autofill_succeeds_when_password_fills_and_login_confirmed(tmp_path):
+    mock_cm, _, mock_context, mock_page = _make_mock_playwright()
+    _wire_autofill_page(mock_page)
+
+    with patch("agents.sso.auth.async_playwright", return_value=mock_cm):
+        session = SsoSession(tmp_path / "profile")
+        # is_logged_in() is called twice inside login_via_autofill(): the
+        # docstring's step 4 confirmation, called here directly (not
+        # through the module's HTTP mock) since it's the session's own
+        # method - False then True mirrors a real "not authenticated
+        # yet, then confirmed after clicking" sequence.
+        session.is_logged_in = AsyncMock(return_value=True)
+        result = await session.login_via_autofill()
+
+    assert result is True
+    mock_page.wait_for_function.assert_awaited_once()
+    mock_page.locator.assert_called_once_with("button:has-text('войти')")
+    mock_locator = mock_page.locator.return_value
+    mock_locator.first.click.assert_awaited_once()
+    mock_context.new_page.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_login_via_autofill_raises_when_password_never_fills(tmp_path):
+    mock_cm, _, _, mock_page = _make_mock_playwright()
+    _wire_autofill_page(mock_page)
+    mock_page.wait_for_function = AsyncMock(side_effect=TimeoutError("no autofill"))
+
+    with patch("agents.sso.auth.async_playwright", return_value=mock_cm):
+        session = SsoSession(tmp_path / "profile")
+        with pytest.raises(SsoAutofillLoginFailed, match="never autofilled"):
+            await session.login_via_autofill(timeout_seconds=1)
+
+    # Never even tried to click a button it had no evidence was ready.
+    mock_page.locator.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_login_via_autofill_raises_when_still_not_authenticated_after_click(tmp_path):
+    mock_cm, _, _, mock_page = _make_mock_playwright()
+    _wire_autofill_page(mock_page)
+
+    with patch("agents.sso.auth.async_playwright", return_value=mock_cm):
+        session = SsoSession(tmp_path / "profile")
+        # Saved credentials are stale (real password changed) - button
+        # gets clicked fine, but the real IsAuthenticated check after it
+        # still says no.
+        session.is_logged_in = AsyncMock(return_value=False)
+        with pytest.raises(SsoAutofillLoginFailed, match="stale"):
+            await session.login_via_autofill()
+
+    mock_page.locator.return_value.first.click.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_login_via_autofill_defaults_to_headless(tmp_path):
+    mock_cm, mock_chromium, _, mock_page = _make_mock_playwright()
+    _wire_autofill_page(mock_page)
+
+    with patch("agents.sso.auth.async_playwright", return_value=mock_cm):
+        session = SsoSession(tmp_path / "profile")
+        session.is_logged_in = AsyncMock(return_value=True)
+        await session.login_via_autofill()
+
+    # Defaults to headless=True on purpose - see login_via_autofill()'s
+    # docstring on why (avoids the headed->headless close/reopen cookie-
+    # flush race is_logged_in() would otherwise trigger mid-call).
+    call_kwargs = mock_chromium.launch_persistent_context.call_args.kwargs
+    assert call_kwargs["headless"] is True
 
 
 @pytest.mark.asyncio

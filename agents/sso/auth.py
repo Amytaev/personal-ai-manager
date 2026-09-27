@@ -59,6 +59,13 @@ class SsoLoginTimeout(RuntimeError):
     logging in within the given timeout."""
 
 
+class SsoAutofillLoginFailed(RuntimeError):
+    """Raised by login_via_autofill() when the password field never got
+    filled in time, or IsAuthenticated still says false after clicking
+    the login button - see that method's docstring for what each of
+    those actually means."""
+
+
 class SsoSession:
     """Owns one persistent browser profile for the SSO/student portal.
 
@@ -184,3 +191,83 @@ class SsoSession:
         raise SsoLoginTimeout(
             f"Login was not completed within {timeout_seconds}s (last URL: {last_url})"
         )
+
+    async def login_via_autofill(self, headless: bool = True, timeout_seconds: int = 20) -> bool:
+        """Re-authenticates using ONLY Chromium's own saved-password
+        autofill for this profile (Desae confirmed directly, 2026-09-27:
+        he saved his SSO password via the browser's own "Save password?"
+        prompt while logging in through this exact profile) - this
+        method never reads, types, or otherwise handles the actual
+        password itself. It:
+
+          1. Opens the SSO login page.
+          2. Waits for Chromium to autofill the password field - checked
+             with page.wait_for_function(), which runs a length check
+             INSIDE the page's own JS context and only ever returns a
+             boolean/timeout back to this Python process. The actual
+             field value never crosses into this code, is never read via
+             input_value(), and is never logged - the whole point of
+             relying on the browser's own autofill instead of an
+             SSO_PASSWORD env var.
+          3. Clicks the "ВОЙТИ" submit button (Chromium autofills BOTH
+             fields together for this site in every real test so far -
+             the login field is filled by the same event as the
+             password field, so waiting on the password field alone is
+             sufficient).
+          4. Confirms real success the same authoritative way everything
+             else in this module does - is_logged_in()'s real
+             Auth/IsAuthenticated call, not a URL/DOM guess.
+
+        Returns True on confirmed success. Raises SsoAutofillLoginFailed
+        if autofill never happened within timeout_seconds (most likely:
+        the password was never saved for this profile, or Chromium's
+        local password manager isn't enabled in this build) or if
+        IsAuthenticated still says false after clicking (most likely:
+        the saved credentials are stale - the real password changed).
+
+        HONEST LIMITATION: relies entirely on Chromium's own autofill
+        heuristics for this specific login form (single saved credential
+        -> autofilled without needing an explicit suggestion-dropdown
+        click, confirmed by direct observation, not assumed) - a form
+        that starts requiring a captcha, an SMS code, or 2FA will make
+        this fail exactly like a truly expired session would, and there
+        is no programmatic way around that; a human still has to log in
+        by hand at that point (scripts/sso_login_setup.py).
+
+        headless defaults to True (not False like login_interactively())
+        on purpose: is_logged_in() below always reuses a headless
+        context, and calling it right after a headED login here would
+        force _ensure_context() to close-and-reopen headless mid-call -
+        exactly the close/reopen sequence that, earlier the same day
+        this method was written, needed a 3s pause to reliably avoid a
+        cookie-flush race (see scripts/sso_login_setup.py's history).
+        Staying headless throughout sidesteps that risk entirely rather
+        than re-relying on a timing workaround.
+        """
+        context = await self._ensure_context(headless=headless)
+        page = await context.new_page()
+        try:
+            await page.goto(SSO_URL, wait_until="domcontentloaded", timeout=30_000)
+            try:
+                await page.wait_for_function(
+                    "document.querySelector('input[type=password]')"
+                    "?.value?.length > 0",
+                    timeout=timeout_seconds * 1000,
+                )
+            except Exception as exc:  # noqa: BLE001 - timeout or selector miss, both mean "autofill didn't happen"
+                raise SsoAutofillLoginFailed(
+                    "Password field was never autofilled - either no password is saved for "
+                    "this profile, or Chromium's local password manager didn't fill it in time."
+                ) from exc
+
+            await page.locator("button:has-text('войти')").first.click(timeout=5_000)
+
+            if not await self.is_logged_in():
+                raise SsoAutofillLoginFailed(
+                    "Clicked the login button, but Auth/IsAuthenticated still says false - "
+                    "the saved credentials are most likely stale (password changed)."
+                )
+            logger.info("SSO autofill login succeeded (profile: %s).", self.profile_dir)
+            return True
+        finally:
+            await page.close()

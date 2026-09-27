@@ -783,9 +783,42 @@ bro's ТЗ — вне рамок этого этапа, как и явно ог�
   `zoneinfo` — на Windows без пакета `tzdata` он не всегда находит базу
   часовых поясов), а не по времени сервера/контейнера.
 
+## Автологин SSO через сохранённый пароль браузера (личный запрос, не из ТЗ)
+
+`SsoSession.login_via_autofill()` (`agents/sso/auth.py`) переавторизуется
+на протухшей SSO-сессии **без единого байта пароля в этом коде,
+`.env` или логах**: пароль сохранён Desae напрямую через нативный
+"Сохранить пароль?" у Chromium в профиле `data/sso_browser_profile`
+(подтверждено вживую, 2026-09-27) — код только открывает страницу
+логина, ждёт, пока Chromium сам заполнит поле пароля
+(`page.wait_for_function()` — проверка длины значения происходит
+целиком внутри JS-контекста страницы, само значение никогда не
+попадает в Python-процесс, не читается через `input_value()`, не
+логируется), жмёт кнопку "ВОЙТИ" и подтверждает успех тем же
+авторитетным способом, что и everywhere в этом модуле —
+`Auth/IsAuthenticated`, а не URL/DOM-догадкой.
+
+Честное ограничение: полностью зависит от эвристик автозаполнения
+Chromium для конкретно этой формы (один сохранённый логин → заполняется
+без явного клика по подсказке, подтверждено вживую, не предположение) —
+капча/SMS/2FA сломают это точно так же, как настоящую протухшую сессию,
+и здесь программного обхода нет, тогда снова нужен человек
+(`scripts/sso_login_setup.py`).
+
+`headless=True` по умолчанию — намеренно, чтобы не провоцировать
+headed→headless переключение контекста внутри `is_logged_in()`
+(риск гонки записи cookie на диск, с которой разбирались чуть раньше
+в этом же файле — см. историю `scripts/sso_login_setup.py`).
+
+Проверочный скрипт `scripts/sso_test_autofill_login.py` — честный тест:
+сначала удаляет только куки профиля (никогда не `Login Data`, где живёт
+сам сохранённый пароль), принудительно переводя сессию в разлогиненное
+состояние, и только потом пробует `login_via_autofill()` — иначе тест
+был бы бессмысленным (текущая кука и так протухает только через ~час).
+
 ## Тесты
 
-**190 тестов, все проходят**: 56 из Phase 2-4 (core infra, БД,
+**194 теста, все проходят**: 56 из Phase 2-4 (core infra, БД,
 scheduler/retry, Weather Agent, Telegram auth/wishlist, LLM provider —
 включая 4 для чата с Claude, `Handlers.chat`) + 43 из Phase 5 (18 для
 Teams-парсера, 8 для `TeamsSession` (включая 2 на исправленный
@@ -794,14 +827,16 @@ Teams-парсера, 8 для `TeamsSession` (включая 2 на испра�
 (`wait_for_load_state`) и 2 на скриншот-диагностику при падении — из
 Phase 6.3, см. выше) + 20 для
 VALORANT (Phase 6) + 8 в `test_telegram_handlers.py` для `/store` с
-картинками (Phase 6.3) + **46 новых для SSO Agent (Этап B)**: 18 в
+картинками (Phase 6.3) + **50 новых для SSO Agent (Этап B)**: 18 в
 `test_sso_parser.py` (`pick_current_semester_id`, `parse_courses`,
 `parse_schedule` — включая чтение времени из container, а не из
 lesson, `iter_umkd_leaf_folders`/`build_umkd_path_by_folder_id`,
-`parse_materials`), 9 в `test_sso_auth.py` (`is_logged_in()`
+`parse_materials`), 13 в `test_sso_auth.py` (`is_logged_in()`
 true/false по реальному ответу `Auth/IsAuthenticated`, не-JSON тело,
 `login_interactively()`/`SsoLoginTimeout`, пересоздание контекста при
-смене headless-режима), 6 в `test_sso_agent.py` (`SsoAgent.run()` на
+смене headless-режима, плюс 4 на `login_via_autofill()` — успех,
+`SsoAutofillLoginFailed` когда пароль не заполнился и когда протух
+после клика, `headless=True` по умолчанию), 6 в `test_sso_agent.py` (`SsoAgent.run()` на
 замоканном `context.request.get`: полный успешный прогон пишет в БД,
 `needs_reauth=True` когда сессия не залогинена, `FAILING` без
 `needs_reauth` когда семестров нет, одна упавшая папка УМКД не валит
