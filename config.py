@@ -58,6 +58,9 @@ class AppConfig:
     valorant_interval_minutes: int
     sso_interval_minutes: int
     auth_checker_interval_minutes: int
+    checker_interval_minutes: int
+    checker_window_start_days: int
+    checker_window_end_days: int
     briefing_hour: int
 
     included_courses: tuple[str, ...]
@@ -101,6 +104,21 @@ def load_config() -> AppConfig:
         # source_status well before the next real sync would have
         # noticed it on its own.
         auth_checker_interval_minutes=_int_env("AUTH_CHECKER_INTERVAL_MINUTES", 30),
+        # Checker Agent (bro's ТЗ) only ever reads already-stored rows
+        # (sso_courses/sso_schedule_entries/tasks/source_status) - no
+        # network, no browser - so it's cheap enough to run on roughly
+        # the same cadence as the SSO/Teams syncs it depends on, without
+        # needing to be nearly as frequent as Auth Checker's own
+        # lightweight is_logged_in() probe.
+        checker_interval_minutes=_int_env("CHECKER_INTERVAL_MINUTES", 120),
+        # Checker's spec §7 default window - how far back/forward from
+        # "now" a schedule occurrence or a Teams assignment's due date
+        # is even considered, so an old assignment from a past semester
+        # (or a schedule occurrence far in the future) never gets
+        # matched against something unrelated just because the course
+        # happens to line up.
+        checker_window_start_days=_int_env("CHECKER_WINDOW_START_DAYS", 7),
+        checker_window_end_days=_int_env("CHECKER_WINDOW_END_DAYS", 30),
         briefing_hour=_int_env("BRIEFING_HOUR", 8),
         included_courses=_csv_env("INCLUDED_COURSES"),
         excluded_courses=_csv_env("EXCLUDED_COURSES"),

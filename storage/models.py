@@ -2,8 +2,8 @@
 
 Tables: tasks, weather_snapshots, valorant_store, notifications,
 agent_runs, sso_courses, sso_schedule_entries, sso_study_materials,
-source_status. Retention/cleanup logic lives in storage/database.py,
-not here — this module only defines shape.
+source_status, checker_findings. Retention/cleanup logic lives in
+storage/database.py, not here — this module only defines shape.
 """
 from __future__ import annotations
 
@@ -132,7 +132,30 @@ CREATE TABLE IF NOT EXISTS source_status (
     last_error              TEXT
 );
 
+-- Checker Agent (bro's ТЗ, "обновлённая логика сверки") - one row per
+-- (course_code, window_start, window_end): a re-run with the SAME
+-- window updates that row in place rather than creating a duplicate
+-- (spec §17 - no history table on this first pass, same reasoning as
+-- source_status above). ``details`` holds the per-occurrence JSON array
+-- (agents/checker/logic.py's evaluate_course() shape) - schedule_entry_id/
+-- type/date/status/matched_assignment_ids per activity, never a
+-- password/cookie/token/MFA code/IIN/DOB (agents/checker/logic.py's
+-- docstring, spec §16).
+CREATE TABLE IF NOT EXISTS checker_findings (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    course_code         TEXT NOT NULL,
+    course_title        TEXT,
+    overall_status      TEXT NOT NULL,
+    checked_at          TEXT NOT NULL,
+    window_start        TEXT NOT NULL,
+    window_end          TEXT NOT NULL,
+    source              TEXT NOT NULL DEFAULT 'checker',
+    details             TEXT,
+    UNIQUE(course_code, window_start, window_end)
+);
+
 CREATE INDEX IF NOT EXISTS idx_agent_runs_agent_time ON agent_runs(agent, finished_at);
+CREATE INDEX IF NOT EXISTS idx_checker_findings_course ON checker_findings(course_code);
 CREATE INDEX IF NOT EXISTS idx_weather_created ON weather_snapshots(created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
 CREATE INDEX IF NOT EXISTS idx_sso_schedule_semester ON sso_schedule_entries(semester_id);

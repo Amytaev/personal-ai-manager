@@ -105,6 +105,20 @@ class Database:
                 ),
             )
 
+    def get_tasks(self, source: str | None = None) -> list[sqlite3.Row]:
+        """All stored tasks, optionally filtered by ``source`` (e.g.
+        "teams") - used by agents/checker/agent.py to read Teams'
+        already-normalized assignments without importing anything from
+        agents/teams/* itself (Checker only ever reads storage, per its
+        spec §2/§19 - it must never call TeamsAgent/SsoAgent or open a
+        session of its own)."""
+        with self.connect() as conn:
+            if source is None:
+                return conn.execute("SELECT * FROM tasks ORDER BY due_at").fetchall()
+            return conn.execute(
+                "SELECT * FROM tasks WHERE source = ? ORDER BY due_at", (source,)
+            ).fetchall()
+
     # -- valorant_store (VALORANT Agent, Phase 6) ------------------------
 
     def save_valorant_store(self, items: list[dict], reset_in: str | None = None) -> None:
@@ -319,6 +333,61 @@ class Database:
         Checker Agent step, point 12)."""
         with self.connect() as conn:
             return conn.execute("SELECT * FROM source_status ORDER BY source").fetchall()
+
+    # -- checker_findings (Checker Agent) ---------------------------------
+
+    def upsert_checker_finding(
+        self,
+        course_code: str,
+        course_title: str | None,
+        overall_status: str,
+        checked_at: str,
+        window_start: str,
+        window_end: str,
+        details: dict,
+        source: str = "checker",
+    ) -> None:
+        """One row per (course_code, window_start, window_end) - a
+        re-run with the SAME window (agents/checker/agent.py's spec §17
+        dedup rule) updates that row in place via the UNIQUE constraint
+        in storage/models.py rather than inserting a duplicate. No
+        history table on this first pass, same as source_status."""
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO checker_findings
+                    (course_code, course_title, overall_status, checked_at,
+                     window_start, window_end, source, details)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(course_code, window_start, window_end) DO UPDATE SET
+                    course_title=excluded.course_title,
+                    overall_status=excluded.overall_status,
+                    checked_at=excluded.checked_at,
+                    source=excluded.source,
+                    details=excluded.details
+                """,
+                (
+                    course_code,
+                    course_title,
+                    overall_status,
+                    checked_at,
+                    window_start,
+                    window_end,
+                    source,
+                    json.dumps(details, ensure_ascii=False),
+                ),
+            )
+
+    def get_checker_findings(self, course_code: str | None = None) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            if course_code is None:
+                return conn.execute(
+                    "SELECT * FROM checker_findings ORDER BY course_code"
+                ).fetchall()
+            return conn.execute(
+                "SELECT * FROM checker_findings WHERE course_code = ? ORDER BY window_start",
+                (course_code,),
+            ).fetchall()
 
     # -- notifications (dedup, TZ v4 §20/§22) ----------------------------
 

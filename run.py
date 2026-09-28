@@ -1,18 +1,19 @@
-"""Entrypoint (+ Auth Checker Agent on top of the SSO Agent (Этап B),
-Phase 6's VALORANT Agent, Phase 5's Teams Agent, Phase 4's Core
-Infrastructure + Telegram Bot + Weather Agent).
+"""Entrypoint (+ Checker Agent on top of Auth Checker Agent, the SSO
+Agent (Этап B), Phase 6's VALORANT Agent, Phase 5's Teams Agent,
+Phase 4's Core Infrastructure + Telegram Bot + Weather Agent).
 
 Wires together config, logging, the single-instance guard, the SQLite
 database, the scheduler, the Telegram bot, and the Weather/Teams/
-VALORANT/SSO/Auth Checker agents. The AI Manager that would aggregate/
-prioritize/summarize everything is still Phase 7 - /weather, /tasks,
-/store and /briefing now all show real data once the relevant agent has
-run at least once. SSO Agent data (normalized schedule/УМКД) has no bot
-command of its own yet - that's Study Manager/Mini App territory,
-explicitly out of scope for this stage. Auth Checker only maintains
-storage/models.py's source_status table (agents/auth_checker.py) for a
-future Study Manager/health report to read - it has no bot command of
-its own either.
+VALORANT/SSO/Auth Checker/Checker agents. The AI Manager that would
+aggregate/prioritize/summarize everything is still Phase 7/Study
+Manager - /weather, /tasks, /store and /briefing now all show real data
+once the relevant agent has run at least once. SSO Agent data
+(normalized schedule/УМКД) has no bot command of its own yet - that's
+Study Manager/Mini App territory, explicitly out of scope for this
+stage. Auth Checker only maintains storage/models.py's source_status
+table (agents/auth_checker.py) and Checker only maintains
+checker_findings (agents/checker/agent.py) - both for a future Study
+Manager to read; neither has a bot command of its own.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ import logging
 import signal
 
 from agents.auth_checker import AuthCheckerAgent
+from agents.checker.agent import CheckerAgent
 from agents.runner import run_and_record
 from agents.sso.agent import SsoAgent
 from agents.sso.auth import SsoSession
@@ -110,6 +112,15 @@ async def _valorant_cycle(agent: ValorantAgent, db: Database, bot: TelegramBot |
         )
 
 
+async def _checker_cycle(agent: CheckerAgent, db: Database) -> None:
+    # No Telegram notification here either, same reasoning as
+    # _auth_checker_cycle below - Checker only writes checker_findings
+    # for a future Study Manager to read; it never itself decides
+    # something is worth alerting the person about (spec §19/§20 -
+    # that's explicitly Study Manager's call, not Checker's).
+    await run_and_record(agent, db)
+
+
 async def _auth_checker_cycle(agent: AuthCheckerAgent, db: Database) -> None:
     # No Telegram notification here on purpose - AUTH_REQUIRED/ERROR for
     # a source is already surfaced by that source's own _teams_cycle/
@@ -160,6 +171,7 @@ async def main() -> None:
     valorant_agent: ValorantAgent | None = None
     sso_agent: SsoAgent | None = None
     auth_checker_agent: AuthCheckerAgent | None = None
+    checker_agent: CheckerAgent | None = None
     # Constructed here (not left for TeamsAgent/SsoAgent's own
     # session-or-None default) SPECIFICALLY so the same instances can
     # also be handed to AuthCheckerAgent below - both TeamsSession and
@@ -264,6 +276,21 @@ async def main() -> None:
             func=lambda: _auth_checker_cycle(auth_checker_agent, db),
         )
 
+        # Checker Agent (bro's ТЗ) - only reads storage (sso_courses/
+        # sso_schedule_entries/tasks/source_status), never opens a
+        # session or calls another agent (see agents/checker/agent.py's
+        # docstring), so it needs no session of its own to share.
+        checker_agent = CheckerAgent(
+            db=db,
+            window_start_days=config.checker_window_start_days,
+            window_end_days=config.checker_window_end_days,
+        )
+        scheduler.register(
+            job_id="checker_check",
+            interval_minutes=config.checker_interval_minutes,
+            func=lambda: _checker_cycle(checker_agent, db),
+        )
+
         scheduler.start()
 
         if weather_agent is not None:
@@ -316,6 +343,13 @@ async def main() -> None:
             # moment /status (or a future Study Manager) could ask for
             # it, not just after the first scheduled interval elapses.
             await _auth_checker_cycle(auth_checker_agent, db)
+
+        if checker_agent is not None:
+            # Same immediate-first-run rationale as the other agents
+            # above - runs after auth_checker_agent's own first cycle so
+            # its source_status gate reflects reality on this very first
+            # pass instead of possibly reading a stale/empty row.
+            await _checker_cycle(checker_agent, db)
 
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()

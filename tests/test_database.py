@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 
@@ -15,6 +16,7 @@ def test_schema_creates_all_required_tables(tmp_db):
     required = {
         "tasks", "weather_snapshots", "valorant_store", "notifications", "agent_runs",
         "sso_courses", "sso_schedule_entries", "sso_study_materials", "source_status",
+        "checker_findings",
     }
     assert required.issubset(tables)
 
@@ -238,3 +240,41 @@ def test_get_all_source_status_orders_by_source(tmp_db):
 
     sources = [row["source"] for row in tmp_db.get_all_source_status()]
     assert sources == ["sso", "teams"]
+
+
+# -- checker_findings (Checker Agent) --------------------------------------
+
+def test_get_checker_findings_is_empty_before_any_run(tmp_db):
+    assert tmp_db.get_checker_findings() == []
+
+
+def test_upsert_checker_finding_stores_details_as_json(tmp_db):
+    tmp_db.upsert_checker_finding(
+        course_code="CSE4112",
+        course_title="Администрирование систем и сетей",
+        overall_status="MATCH",
+        checked_at="2026-09-28T00:00:00+00:00",
+        window_start="2026-09-21",
+        window_end="2026-10-28",
+        details={"activities": [{"type": "LAB", "status": "MATCH"}]},
+    )
+
+    row = tmp_db.get_checker_findings("CSE4112")[0]
+    assert row["overall_status"] == "MATCH"
+    assert json.loads(row["details"])["activities"][0]["type"] == "LAB"
+
+
+def test_upsert_checker_finding_dedupes_by_course_and_window(tmp_db):
+    kwargs = dict(
+        course_code="CSE4112",
+        course_title="X",
+        checked_at="2026-09-28T00:00:00+00:00",
+        window_start="2026-09-21",
+        window_end="2026-10-28",
+    )
+    tmp_db.upsert_checker_finding(overall_status="NO_MATCH", details={"activities": []}, **kwargs)
+    tmp_db.upsert_checker_finding(overall_status="MATCH", details={"activities": [1]}, **kwargs)
+
+    findings = tmp_db.get_checker_findings("CSE4112")
+    assert len(findings) == 1
+    assert findings[0]["overall_status"] == "MATCH"
