@@ -3,10 +3,11 @@
 Локальная система персональной автоматизации (Teams / Weather / VALORANT →
 AI Manager → Telegram). Полное ТЗ см. `TZ_v4.md` (хранится отдельно).
 
-**Текущее состояние: Checker Agent добавлен поверх Auth Checker Agent +
-Этапа B (SSO Agent + автологин).** Teams Agent (Phase 5), VALORANT
-Agent (Phase 6), SSO Agent (bro's ТЗ, Этап A/B), Auth Checker Agent и
-теперь Checker Agent (bro's ТЗ, "обновлённая логика сверки") все
+**Текущее состояние: Study Manager Agent добавлен поверх Auth Checker
+Agent + Checker Agent + Этапа B (SSO Agent + автологин).** Teams Agent
+(Phase 5), VALORANT Agent (Phase 6), SSO Agent (bro's ТЗ, Этап A/B),
+Auth Checker Agent, Checker Agent ("обновлённая логика сверки") и
+теперь Study Manager Agent (bro's ТЗ, 36-пунктовая спека) все
 реализованы и подключены в `run.py`, `/store` в Telegram показывает
 реальные скины с картинками, `/schedule`/`/umkd` показывают уже
 собранные SSO-данные, `/week` — личная (не из ТЗ бро) команда,
@@ -14,14 +15,19 @@ Agent (Phase 6), SSO Agent (bro's ТЗ, Этап A/B), Auth Checker Agent и
 сессия (Teams, Stack B или SSO) шлёт отдельное Telegram-уведомление
 вместо тихого падения. Auth Checker параллельно ведёт единый
 `source_status` health-report (Teams + SSO:
-`OK`/`AUTH_REQUIRED`/`ERROR`/`UNAVAILABLE`/`UNKNOWN`), а Checker поверх
+`OK`/`AUTH_REQUIRED`/`ERROR`/`UNAVAILABLE`/`UNKNOWN`), Checker поверх
 него сопоставляет расписание SSO с заданиями Teams по типу занятия
 (LAB/PRACTICE/LECTURE) и пишет находки в `checker_findings`
 (`MATCH`/`PARTIAL_MATCH`/`NO_MATCH`/`UNMATCHED_COURSE`, плюс статусы
-источника когда Teams/SSO недоступны) — без Telegram-команды пока, обе
-таблицы ждут Study Manager. Study Manager и Telegram Mini App из bro's
-ТЗ остаются нетронутыми — следующий шаг, по прежнему порядку (Auth
-Checker → Checker → Study Manager, теперь на последнем пункте).
+источника когда Teams/SSO недоступны), а Study Manager combining-слой
+поверх ВСЕХ четверых (через их публичные интерфейсы, никогда не лезя
+внутрь) даёт единый `get_dashboard()`/`get_upcoming_schedule()`/
+`get_upcoming_tasks()`/`get_overdue_tasks()`/`get_course_tasks()`/
+`get_course_materials()`/`get_checker_findings()`/`get_source_status()`/
+`refresh()` — без Telegram-команды пока (ждёт будущий AI Manager, см.
+раздел ниже). Telegram Mini App и сам AI Manager (LLM-слой) из bro's
+ТЗ остаются нетронутыми — по спеке Study Manager явно не должен их
+касаться (§33), это следующий и последний шаг.
 
 ## Что уже есть
 
@@ -38,6 +44,7 @@ Checker → Checker → Study Manager, теперь на последнем пу
 | **SSO/УМКД — чистый JSON API, никакого HTML-парсинга** | `agents/sso/auth.py`, `agents/sso/parser.py`, `agents/sso/agent.py` | ✅ Этап B, реальные данные подтверждены (см. раздел ниже) |
 | **Auth Checker Agent** — единый `source_status` health-check (Teams + SSO) | `agents/auth_checker.py`, `storage/models.py` (`source_status`) | ✅ bro's ТЗ, следующий слой архитектуры (см. раздел ниже) |
 | **Checker Agent** — сверка расписания SSO с заданиями Teams по типу занятия | `agents/checker/logic.py`, `agents/checker/agent.py`, `storage/models.py` (`checker_findings`) | ✅ bro's ТЗ, "обновлённая логика сверки" (см. раздел ниже) |
+| **Study Manager Agent** — combining-слой поверх Teams/SSO/Checker/Auth Checker (только публичные интерфейсы) | `agents/study_manager/logic.py`, `agents/study_manager/agent.py` | ✅ bro's ТЗ, 36-пунктовая спека (см. раздел ниже) |
 
 ## Phase 1 → Phase 5: закрытый вопрос про Graph API
 
@@ -1011,9 +1018,117 @@ window_end)`, повторный прогон с тем же окном обно
 изменений на этом этапе (по прямому указанию бро). Старые записи из
 прошлых семестров/окон не удаляются автоматически.
 
+## Study Manager Agent — combining-слой поверх Teams/SSO/Checker/Auth Checker (bro's ТЗ)
+
+`agents/study_manager/` (пакет: `logic.py` — чистые функции без БД/сети,
+`agent.py` — `StudyManager(BaseAgent)`) — **не новый source-агент и не
+"суперагент"**: он ничего не собирает сам, а комбинирует то, что уже
+собрали `TeamsAgent`/`SsoAgent`/`CheckerAgent`/`AuthCheckerAgent`, и
+только через их публичные интерфейсы (`await agent.run()`) — никогда
+не лезет в `agents/teams/*`, `agents/sso/*`, `agents/checker/logic.py`
+или `agents/auth_checker.py` напрямую, не открывает Playwright сам, не
+делает Microsoft/SSO-авторизацию, не парсит HTML/API Teams/SSO
+напрямую, не скачивает файлы УМКД, не шлёт Telegram, не вызывает Claude
+API, не принимает решений за пользователя, не пишет обратно в
+Teams/SSO. Этот "публичный интерфейс, а не внутренности" принцип (§4/§31
+спеки) прочитан достаточно строго, чтобы включать и внутренний модуль
+самого Checker (`agents/checker/logic.py`) — поэтому
+`normalize_course_code`/`normalize_title`/`extract_course_code`/
+`extract_teams_course_title`/еженедельное разворачивание расписания в
+`agents/study_manager/logic.py` **осознанно продублированы**, а не
+импортированы из `agents/checker/logic.py` — небольшое дублирование
+кода в обмен на честную границу модулей.
+
+**Два режима синхронизации** (§7): `StudyManager.run()` (сработает по
+расписанию, `STUDY_MANAGER_INTERVAL_MINUTES`=120 по умолчанию) и ручной
+`StudyManager.refresh()` — оба делают одно и то же: (1) Auth Checker
+первым, чтобы решение "стоит ли вообще пробовать этот источник" ниже
+опиралось на состояние ДО этого цикла; (2) Teams/SSO-агенты
+запускаются, если их последний известный статус не `UNAVAILABLE`
+(сессия вообще не подключена в этом запуске) — `AUTH_REQUIRED`/`ERROR`
+НЕ пропускаются, потому что SSO Agent сам пробует автологин, а оба
+агента и так деградируют, а не падают; (3) Auth Checker снова — только
+он пишет `source_status`, так что второй вызов делает статус свежим
+именно к этому циклу перед тем, как его прочитает Checker; (4) Checker
+запускается, только если **и** Teams, **и** SSO прямо сейчас `OK`
+(Checker и так самогейтится внутри, но эта явная проверка делает
+"Checker не запускается, если нужный источник недоступен" наблюдаемым
+поведением самого Study Manager, а не только Checker); (5) финальный
+статус (см. ниже) и список внутренних ошибок. Исключение одного
+источника (`try/except` вокруг каждого шага) никогда не останавливает
+остальные — упавший Teams не мешает SSO/Checker отработать своё (§28).
+
+**Обычные чтения никогда не открывают браузер/сеть** (§27):
+`get_dashboard()`/`get_upcoming_schedule()`/`get_upcoming_tasks()`/
+`get_overdue_tasks()`/`get_course_tasks()`/`get_course_materials()`/
+`get_checker_findings()`/`get_source_status()` — все читают только уже
+сохранённые строки SQLite (`tasks`/`sso_courses`/
+`sso_schedule_entries`/`sso_study_materials`/`checker_findings`/
+`source_status`). Браузер/сеть трогает только `refresh()`, и то не
+напрямую, а через `await teams_agent.run()`/`await sso_agent.run()`.
+
+- **`get_upcoming_schedule(days_ahead)`** — та же проблема, что уже
+  решалась в Checker Agent: `sso_schedule_entries` хранит еженедельный
+  шаблон (`day_title` + время), без даты. `expand_weekly_schedule()`
+  разворачивает каждую строку в конкретные календарные даты от "сейчас"
+  до `days_ahead` дней вперёд, сортирует по (дата, время), и не может
+  создать дубликат по построению (каждая строка обходится по окну ровно
+  один раз на подходящий день недели).
+- **`get_upcoming_tasks()`/`get_overdue_tasks()`** — "просрочено" **не**
+  берётся из сохранённой Teams-строки `status` напрямую: та строка
+  вычислена один раз, в момент последнего успешного синка, и может
+  устареть, если Teams был `AUTH_REQUIRED` несколько дней подряд.
+  `is_task_overdue()` пересчитывает "просрочено ли это сейчас" из
+  структурного `due_at` каждый раз заново (§15); Teams' `status`
+  доверяется только для "точно ли это уже сдано"
+  (`returned`/`submitted`/`completed`), потому что этот факт не портится
+  временем. Задание без `due_at` никогда не ломает обработку — просто
+  не попадает ни в один из двух списков (§14).
+- **`get_course_tasks(course_code)`/`get_course_materials(course_code)`** —
+  сопоставление курса (`resolve_course()`): сначала по коду, при
+  неудаче — по точному нормализованному названию, без fuzzy matching.
+  Неоднозначное совпадение возвращает явный `AMBIGUOUS`, ничего не
+  найдено — явный `NOT_FOUND`; ни один из двух никогда не выдаёт список
+  заданий/материалов наугад (§16/§17). УМКД-материалы — только метаданные
+  (`file_id`/название/категория), без скачивания бинарного содержимого.
+- **`get_dashboard()`** — одна агрегирующая структура (`status`,
+  `today`/`tomorrow` из расписания, `upcoming_tasks`, `overdue_tasks`,
+  `checker_findings`, `source_status`), сознательно БЕЗ материалов
+  (могут быть большими — §26), под формой примера из §34 бро.
+
+**Итоговый статус** (`StudyManagerStatus`, §19) — `combine_source_status()`
+в `logic.py`: оба источника `OK` → `OK`; ровно один `OK` → `PARTIAL`
+(полезные данные всё равно есть, ровно пример бро из §8: Teams=OK +
+SSO=ERROR → `PARTIAL`); оба не `OK` и оба именно `AUTH_REQUIRED` →
+`AUTH_REQUIRED` (нужен реальный человеческий логин); оба не `OK`, но не
+оба `AUTH_REQUIRED` → `SOURCE_UNAVAILABLE`. `ERROR` этой функцией
+никогда не возвращается — он зарезервирован только за настоящим
+внутренним исключением внутри `refresh()` самого Study Manager (§19: не
+путать "источник временно недоступен" с "у нас сломалась логика").
+
+**Свежесть данных** (§20/§21): `get_source_status()` отдаёт
+`source_status` как есть — `last_successful_sync` показывает, когда
+источник реально последний раз сработал, даже если сейчас он
+`AUTH_REQUIRED`; старые `tasks`/`sso_*` строки никогда не удаляются
+только из-за того, что источник временно недоступен (то же правило,
+что уже соблюдает Auth Checker Agent на уровне `source_status`).
+
+**Безопасность** (§29, буквальное требование бро): нигде в этом модуле
+не логируется пароль, cookie, session/access token, MFA-код, ИИН, дата
+рождения или токен Telegram-бота — только имя источника, статус,
+счётчики, `last_successful_sync` и тип/сообщение исключения без секретных
+данных (та же дисциплина, что уже у `run_isolated()`/Auth Checker Agent).
+
+Explicitly НЕ реализовано в этом шаге (§33, прямое указание бро): AI
+Manager, Claude API/Claude Agent SDK, OpenAI API, LLM provider, разбор
+естественного языка из Telegram, Telegram Mini App, WhatsApp, Agent
+Recruiter/Factory, автоматическая отправка Telegram-уведомлений,
+автоматическое скачивание УМКД, запись в Teams/SSO, изменения данных
+VALORANT, MFA-релей через Telegram.
+
 ## Тесты
 
-**264 теста, все проходят**: 56 из Phase 2-4 (core infra, БД,
+**300 тестов, все проходят**: 56 из Phase 2-4 (core infra, БД,
 scheduler/retry, Weather Agent, Telegram auth/wishlist, LLM provider —
 включая 4 для чата с Claude, `Handlers.chat`) + 43 из Phase 5 (18 для
 Teams-парсера, 8 для `TeamsSession` (включая 2 на исправленный
@@ -1154,6 +1269,15 @@ true/false по реальному ответу `Auth/IsAuthenticated`, не-JSO
   `get_checker_findings()`: пусто до первого прогона, `details`
   сохраняется как JSON и читается обратно, апсерт по
   `(course_code, window_start, window_end)` не создаёт дубликат.
+- `tests/test_study_manager.py` (**36 новых**) — все 28 обязательных
+  сценариев из bro's ТЗ §32 (source status ×5, tasks ×5, schedule ×4,
+  courses ×4, checker ×3, freshness ×3, partial failure ×2, dashboard
+  ×2) плюс дополнительные на `resolve_course()`/`course_matches()`,
+  нормализацию кода/названия курса, порядок вызовов Auth Checker
+  внутри `refresh()` (до и после Teams/SSO), пропуск источника со
+  статусом `UNAVAILABLE`, `run()` как обёртка над `refresh()` с
+  корректным `AgentStatus`, и что `get_course_materials()` отдаёт
+  только метаданные, никогда бинарное содержимое файла.
 
 Реальный браузер в тестах не запускается и не нужен нигде — вся
 логика Teams Agent и VALORANT Agent (парсинг, дедупликация,

@@ -27,6 +27,7 @@ def _config(tmp_path) -> AppConfig:
         checker_interval_minutes=120,
         checker_window_start_days=7,
         checker_window_end_days=30,
+        study_manager_interval_minutes=120,
         briefing_hour=8,
         included_courses=(),
         excluded_courses=(),

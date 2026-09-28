@@ -61,6 +61,7 @@ class AppConfig:
     checker_interval_minutes: int
     checker_window_start_days: int
     checker_window_end_days: int
+    study_manager_interval_minutes: int
     briefing_hour: int
 
     included_courses: tuple[str, ...]
@@ -119,6 +120,14 @@ def load_config() -> AppConfig:
         # happens to line up.
         checker_window_start_days=_int_env("CHECKER_WINDOW_START_DAYS", 7),
         checker_window_end_days=_int_env("CHECKER_WINDOW_END_DAYS", 30),
+        # Study Manager (bro's ТЗ) only ever reads already-stored rows
+        # for its own get_*() methods (spec §27 - no network, no
+        # browser there at all); a scheduled refresh() is what actually
+        # drives Teams/SSO/Auth Checker/Checker's own real syncs, so
+        # this interval is deliberately the same order of magnitude as
+        # sso_interval_minutes/checker_interval_minutes above rather
+        # than auth_checker's much cheaper 30-minute cadence.
+        study_manager_interval_minutes=_int_env("STUDY_MANAGER_INTERVAL_MINUTES", 120),
         briefing_hour=_int_env("BRIEFING_HOUR", 8),
         included_courses=_csv_env("INCLUDED_COURSES"),
         excluded_courses=_csv_env("EXCLUDED_COURSES"),

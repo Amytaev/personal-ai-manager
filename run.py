@@ -27,6 +27,7 @@ from agents.checker.agent import CheckerAgent
 from agents.runner import run_and_record
 from agents.sso.agent import SsoAgent
 from agents.sso.auth import SsoSession
+from agents.study_manager.agent import StudyManager
 from agents.teams.agent import TeamsAgent
 from agents.teams.auth import TeamsSession
 from agents.valorant.agent import ValorantAgent
@@ -121,6 +122,18 @@ async def _checker_cycle(agent: CheckerAgent, db: Database) -> None:
     await run_and_record(agent, db)
 
 
+async def _study_manager_cycle(agent: StudyManager, db: Database) -> None:
+    # No Telegram notification here either, same reasoning as
+    # _checker_cycle/_auth_checker_cycle above - Study Manager's own
+    # scheduled cycle is just refresh() (spec §7/§22): it drives Teams/
+    # SSO/Auth Checker/Checker's real syncs and updates source_status/
+    # checker_findings as a side effect of THEIR own run() calls, but it
+    # never itself decides something is worth alerting the person about
+    # - that is explicitly the future AI Manager's job (spec §25/§33),
+    # not this stage's.
+    await run_and_record(agent, db)
+
+
 async def _auth_checker_cycle(agent: AuthCheckerAgent, db: Database) -> None:
     # No Telegram notification here on purpose - AUTH_REQUIRED/ERROR for
     # a source is already surfaced by that source's own _teams_cycle/
@@ -172,6 +185,7 @@ async def main() -> None:
     sso_agent: SsoAgent | None = None
     auth_checker_agent: AuthCheckerAgent | None = None
     checker_agent: CheckerAgent | None = None
+    study_manager_agent: StudyManager | None = None
     # Constructed here (not left for TeamsAgent/SsoAgent's own
     # session-or-None default) SPECIFICALLY so the same instances can
     # also be handed to AuthCheckerAgent below - both TeamsSession and
@@ -291,6 +305,25 @@ async def main() -> None:
             func=lambda: _checker_cycle(checker_agent, db),
         )
 
+        # Study Manager Agent (bro's ТЗ) - combines Teams/SSO/Checker/
+        # Auth Checker via their public interfaces only (spec §4/§31),
+        # never a session/browser of its own (see agents/study_manager/
+        # agent.py's docstring), so - like Checker above - it needs no
+        # session to share. Handed the SAME agent instances already
+        # registered above rather than constructing its own copies.
+        study_manager_agent = StudyManager(
+            db=db,
+            teams_agent=teams_agent,
+            sso_agent=sso_agent,
+            checker_agent=checker_agent,
+            auth_checker_agent=auth_checker_agent,
+        )
+        scheduler.register(
+            job_id="study_manager_refresh",
+            interval_minutes=config.study_manager_interval_minutes,
+            func=lambda: _study_manager_cycle(study_manager_agent, db),
+        )
+
         scheduler.start()
 
         if weather_agent is not None:
@@ -350,6 +383,16 @@ async def main() -> None:
             # its source_status gate reflects reality on this very first
             # pass instead of possibly reading a stale/empty row.
             await _checker_cycle(checker_agent, db)
+
+        # Deliberately NO immediate _study_manager_cycle() call here,
+        # unlike every agent above: StudyManager.refresh() would just
+        # re-run Teams/SSO/Auth Checker/Checker's own syncs a second
+        # time in a row (they already ran once each, right above) -
+        # pure duplicate browser/API work for no benefit, since Study
+        # Manager's own get_*() reads (spec §27) already see this
+        # startup's fresh source_status/tasks/sso_* rows regardless of
+        # whether refresh() itself has ever run. It still joins the
+        # scheduler above for its own periodic refresh cycle.
 
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
