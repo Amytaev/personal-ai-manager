@@ -13,6 +13,7 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+from agents.ai_manager.agent import AIManager
 from config import AppConfig
 from storage.database import Database
 from storage.wishlist import WishlistStore
@@ -24,7 +25,13 @@ logger = logging.getLogger(__name__)
 
 
 class TelegramBot:
-    def __init__(self, config: AppConfig, db: Database, wishlist: WishlistStore) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        db: Database,
+        wishlist: WishlistStore,
+        ai_manager: AIManager | None = None,
+    ) -> None:
         if not config.telegram_bot_token:
             raise ValueError("TELEGRAM_BOT_TOKEN is not set")
         if not config.telegram_chat_id:
@@ -32,7 +39,11 @@ class TelegramBot:
 
         self.config = config
         self.db = db
-        self.handlers = Handlers(db=db, wishlist=wishlist, config=config)
+        # AI Manager ТЗ v3 §43 - AI Manager is constructed by run.py, not
+        # here or inside Handlers; TelegramBot only wires the already-
+        # built instance through to Handlers.chat(). None (no
+        # LLM_API_KEY) keeps the plain-passthrough chat() fallback.
+        self.handlers = Handlers(db=db, wishlist=wishlist, config=config, ai_manager=ai_manager)
 
         self.app: Application = Application.builder().token(config.telegram_bot_token).build()
         self._register_handlers()

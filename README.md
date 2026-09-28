@@ -1126,14 +1126,15 @@ Recruiter/Factory, автоматическая отправка Telegram-уве
 автоматическое скачивание УМКД, запись в Teams/SSO, изменения данных
 VALORANT, MFA-релей через Telegram.
 
-## AI Manager — оркестрирующий слой поверх Tool Registry (bro's ТЗ v3, в процессе)
+## AI Manager — оркестрирующий слой поверх Tool Registry (bro's ТЗ v3)
 
-**Статус: реализовано ядро (Audit → Study Overrides → Effective Data →
-LLM Provider tool-calling → Tool Registry → System Prompt → AIManager),
-ещё НЕ подключено к Telegram** — по собственному порядку спеки бро
-(Этап O "Telegram Adapter" идёт только после того, как внутренний AI
-Manager проверен отдельно). ТЗ v3 — 96 пунктов, самая большая спека в
-этом проекте; ведётся поэтапно, как и требует сама спека.
+**Статус: ядро (Audit → Study Overrides → Effective Data → LLM Provider
+tool-calling → Tool Registry → System Prompt → AIManager) реализовано И
+подключено к Telegram (Этап O)** — по собственному порядку спеки бро
+(Telegram Adapter подключён только после того, как внутренний AI
+Manager был проверен отдельно, 366/366 тестов). ТЗ v3 — 96 пунктов,
+самая большая спека в этом проекте; реализована поэтапно, как и
+требует сама спека.
 
 **Study Overrides** (`storage/models.py`'s `study_overrides`,
 `storage/database.py`'s `upsert_override()`/`get_overrides()`/
@@ -1220,26 +1221,57 @@ LLM-провайдера (сеть/5xx), никогда не для упавше
 реальные учебные данные пользователя, а не только секреты) — только
 `name`/`status`/`duration_ms` (§61).
 
-**Явные упрощения этого шага, зафиксированные честно** (проект
+**Telegram Adapter** (§43, Этап O — `telegram_bot/handlers.py`'s
+`Handlers.chat()`, `telegram_bot/bot.py`, `run.py`) — отдельный слой
+между Telegram и AI Manager, как и требует спека: `TelegramBot`/
+`Handlers` принимают опциональный `ai_manager: AIManager | None`,
+сконструированный **только** в `run.py` (никогда не самим
+`AIManager` — §5/§43's "AI Manager сам не создаёт Bot-инстанс").
+`run.py` строит `AIManager` только когда реально задан
+`LLM_API_KEY` — тем же `provider = get_provider(config)` и тем же
+`study_manager_agent`, что уже зарегистрирован в scheduler'е (не
+второй экземпляр), через `tools/registry.py`'s
+`build_default_registry(db, study_manager_agent)`. Если ключа нет,
+`ai_manager` остаётся `None`, и `chat()` откатывается к прежнему
+прямому `get_provider()`/`provider.generate()` (тот же текст
+"LLM не настроен...", что и раньше — обратная совместимость,
+§80, ни один из 366 существующих тестов не тронут и не удалён).
+
+Диалоговый контекст (§34 — сознательно НЕ full long-term
+memory/RAG, см. §66) — простой список `{"role", "content"}`,
+кэпнутый `_MAX_HISTORY_MESSAGES = 20` сообщений, живёт только в
+памяти процесса на самом `Handlers` (не в SQLite, сбрасывается при
+рестарте — это и есть "minimal", как явно требует §34), передаётся
+в `handle_message(question, history=...)` как **копия** (не та же
+ссылка — `AIManager` и сам `Handlers` мутируют каждый свой список
+по-своему) и пополняется только по успешному (`status == "OK"`)
+обмену — сбойный/таймаутнутый/оборванный по max_iterations ответ не
+портит контекст следующего сообщения. Любое исключение из
+`handle_message()` (сеть, providers, баг в tool) ловится тут же и
+превращается в то же честное "⚠️ Не удалось получить ответ...", что
+и раньше — не может уронить бота.
+
+**Явные упрощения, зафиксированные честно** (проект
 однопользовательский — единственный `TELEGRAM_CHAT_ID`, уже
 проверяемый `telegram_bot/auth.py`'s `require_authorized()` для
 каждого хендлера): полноценная multi-user identity-изоляция (§44/§78)
 архитектурно не нужна поверх уже существующей проверки одного
 chat_id, поэтому не строилась отдельно — сделано честно, а не
-имитацией. Telegram Adapter (§43, Этап O) и хранение диалогового
-контекста между сообщениями Telegram (§34, за пределами уже
-поддержанного `handle_message(..., history=...)`) — следующий шаг.
+имитацией.
 
-Explicitly НЕ реализовано на этом шаге (§94, прямое указание бро):
-Telegram Mini App, WhatsApp, Agent Recruiter/Factory, внешние
-write-операции в Teams/SSO, покупки VALORANT, полноценная long-term
-memory/vector DB/RAG, автоматическая передача MFA через Telegram,
-сложный semester planner, одновременная поддержка нескольких LLM
-providers.
+Explicitly НЕ реализовано (§94, прямое указание бро): Telegram Mini
+App, WhatsApp, Agent Recruiter/Factory, внешние write-операции в
+Teams/SSO, покупки VALORANT, полноценная long-term memory/vector
+DB/RAG, автоматическая передача MFA через Telegram, сложный semester
+planner, одновременная поддержка нескольких LLM providers.
 
 ## Тесты
 
-**366 тестов, все проходят**: 56 из Phase 2-4 (core infra, БД,
+**374 тестов, все проходят** (366 было до Telegram Adapter + 8 новых
+на `Handlers.chat()` с `ai_manager`/на `TelegramBot`'s опциональный
+`ai_manager` — история диалога, fallback без `LLM_API_KEY`, honest
+error handling при упавшем `handle_message()`, см. Telegram Adapter
+выше): 56 из Phase 2-4 (core infra, БД,
 scheduler/retry, Weather Agent, Telegram auth/wishlist, LLM provider —
 включая 4 для чата с Claude, `Handlers.chat`) + 43 из Phase 5 (18 для
 Teams-парсера, 8 для `TeamsSession` (включая 2 на исправленный

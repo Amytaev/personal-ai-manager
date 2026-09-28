@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agents.ai_manager.agent import AIManagerResult, ToolCallLog
 from llm.provider import NullProvider
 from storage.wishlist import WishlistStore
 from telegram_bot.handlers import Handlers
@@ -526,3 +527,124 @@ async def test_chat_reports_a_friendly_error_when_the_provider_fails(handlers):
     text = update.message.reply_text.call_args.args[0]
     assert "не удалось" in text.lower()
     assert "boom" not in text
+
+
+# ===========================================================================
+# chat() routed through an AIManager (AI Manager ТЗ v3 §43/§95, Этап O) -
+# when Handlers is constructed with an ai_manager, chat() must call
+# AIManager.handle_message() instead of the plain get_provider()/
+# provider.generate() passthrough above, feed back the running dialogue
+# history (spec §34), and never let an AIManager/provider/tool failure
+# crash the bot.
+# ===========================================================================
+
+
+@pytest.fixture
+def handlers_with_ai_manager(tmp_db, tmp_path):
+    wishlist = WishlistStore(tmp_path / "wishlist.json")
+    fake_ai_manager = MagicMock()
+    fake_ai_manager.handle_message = AsyncMock()
+    h = Handlers(db=tmp_db, wishlist=wishlist, config=MagicMock(), ai_manager=fake_ai_manager)
+    return h, fake_ai_manager
+
+
+@pytest.mark.asyncio
+async def test_chat_with_ai_manager_routes_through_handle_message_and_replies_with_its_text(
+    handlers_with_ai_manager,
+):
+    handlers, fake_ai_manager = handlers_with_ai_manager
+    fake_ai_manager.handle_message.return_value = AIManagerResult(
+        request_id="r1", text="Сегодня пар нет.", tool_calls=[], status="OK"
+    )
+    update, context = _fake_update_and_context(text="Что там по учебе?")
+
+    await handlers.chat(update, context)
+
+    fake_ai_manager.handle_message.assert_awaited_once_with(
+        "Что там по учебе?", history=[]
+    )
+    assert update.message.reply_text.call_args.args[0] == "Сегодня пар нет."
+
+
+@pytest.mark.asyncio
+async def test_chat_with_ai_manager_ignores_empty_or_whitespace_only_text(handlers_with_ai_manager):
+    handlers, fake_ai_manager = handlers_with_ai_manager
+    update, context = _fake_update_and_context(text="   ")
+
+    await handlers.chat(update, context)
+
+    fake_ai_manager.handle_message.assert_not_called()
+    update.message.reply_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_chat_with_ai_manager_appends_successful_turns_to_history_and_replays_it(
+    handlers_with_ai_manager,
+):
+    handlers, fake_ai_manager = handlers_with_ai_manager
+    fake_ai_manager.handle_message.return_value = AIManagerResult(
+        request_id="r1", text="Ок.", tool_calls=[], status="OK"
+    )
+    update, context = _fake_update_and_context(text="первый вопрос")
+    await handlers.chat(update, context)
+
+    update2, context2 = _fake_update_and_context(text="второй вопрос")
+    await handlers.chat(update2, context2)
+
+    second_call_kwargs = fake_ai_manager.handle_message.call_args_list[1].kwargs
+    assert second_call_kwargs["history"] == [
+        {"role": "user", "content": "первый вопрос"},
+        {"role": "assistant", "content": "Ок."},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_chat_with_ai_manager_does_not_extend_history_on_a_failed_turn(
+    handlers_with_ai_manager,
+):
+    handlers, fake_ai_manager = handlers_with_ai_manager
+    fake_ai_manager.handle_message.return_value = AIManagerResult(
+        request_id="r1",
+        text="Не получилось обратиться к LLM прямо сейчас. Попробуй ещё раз чуть позже.",
+        tool_calls=[],
+        status="LLM_PROVIDER_ERROR",
+    )
+    update, context = _fake_update_and_context(text="вопрос")
+    await handlers.chat(update, context)
+
+    update2, context2 = _fake_update_and_context(text="следующий вопрос")
+    await handlers.chat(update2, context2)
+
+    second_call_kwargs = fake_ai_manager.handle_message.call_args_list[1].kwargs
+    assert second_call_kwargs["history"] == []
+
+
+@pytest.mark.asyncio
+async def test_chat_with_ai_manager_reports_a_friendly_error_when_handle_message_raises(
+    handlers_with_ai_manager,
+):
+    handlers, fake_ai_manager = handlers_with_ai_manager
+    fake_ai_manager.handle_message.side_effect = RuntimeError("boom")
+    update, context = _fake_update_and_context(text="вопрос")
+
+    await handlers.chat(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "не удалось" in text.lower()
+    assert "boom" not in text
+
+
+@pytest.mark.asyncio
+async def test_chat_with_ai_manager_replies_even_with_tool_calls_logged(handlers_with_ai_manager):
+    handlers, fake_ai_manager = handlers_with_ai_manager
+    fake_ai_manager.handle_message.return_value = AIManagerResult(
+        request_id="r1",
+        text="Завтра одна пара.",
+        tool_calls=[ToolCallLog(name="get_upcoming_schedule", status="OK", duration_ms=12.3)],
+        status="OK",
+    )
+    update, context = _fake_update_and_context(text="что завтра?")
+
+    await handlers.chat(update, context)
+
+    assert update.message.reply_text.call_args.args[0] == "Завтра одна пара."

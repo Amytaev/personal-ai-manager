@@ -19,6 +19,7 @@ from telegram import InputMediaPhoto, Update
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
+from agents.ai_manager.agent import AIManager
 from config import AppConfig
 from llm.provider import NullProvider, get_provider
 from storage.database import Database
@@ -45,6 +46,17 @@ STATUS_MARKERS = {"working": "✅", "degraded": "\U0001f7e1", "failing": "\U0001
 # 4) would still need a cap so a single /store call can't blow past
 # Telegram's own limit.
 _MAX_MEDIA_GROUP_ITEMS = 10
+
+# AI Manager ТЗ v3 §34 - "minimal short-term dialogue context", explicitly
+# NOT full long-term memory/RAG (spec §66). A plain capped list of
+# {"role", "content"} messages kept on the Handlers instance (in-process
+# only - never persisted to SQLite or disk, so it resets on restart,
+# which is fine for "minimal" context) is threaded into every
+# AIManager.handle_message() call as `history=`. Counts individual
+# messages (user + assistant), not exchanges, so this caps at 10 back-
+# and-forth turns - generous for "а третья?"-style follow-ups without
+# growing unboundedly across a long-running bot process.
+_MAX_HISTORY_MESSAGES = 20
 
 # GetTable's real column titles (agents/sso/parser.py's docstring/tests -
 # e.g. "MONDAY_SHORT") are English weekday codes, not Russian day names
@@ -151,10 +163,24 @@ def _format_store_text(skins_json: str, checked_at: str) -> str:
 
 
 class Handlers:
-    def __init__(self, db: Database, wishlist: WishlistStore, config: AppConfig):
+    def __init__(
+        self,
+        db: Database,
+        wishlist: WishlistStore,
+        config: AppConfig,
+        ai_manager: AIManager | None = None,
+    ):
         self.db = db
         self.wishlist = wishlist
         self.config = config
+        # Optional - spec §95 Этап O wires this in from run.py once an
+        # LLM_API_KEY is configured; None keeps the old plain-passthrough
+        # chat() behavior (and every existing test for it) working
+        # unchanged, rather than forcing every caller/test to construct a
+        # full AIManager just to exercise Handlers.
+        self.ai_manager = ai_manager
+        # spec §34's short-term dialogue context - see _MAX_HISTORY_MESSAGES.
+        self._chat_history: list[dict] = []
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
@@ -517,26 +543,69 @@ class Handlers:
             await update.message.reply_text(f"{name} не найден в wishlist.")
 
     async def chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Ad-hoc chat with the configured LLM (llm/provider.py).
+        """Ad-hoc chat, routed through the AI Manager (AI Manager ТЗ v3
+        §43's Telegram Adapter layer - Telegram Adapter → AI Manager →
+        Tools, never Telegram → Tools directly and never AI Manager
+        constructing its own Bot instance).
 
         Handles any plain-text message that isn't a slash command - no
         /ask prefix needed, per bro's Phase 5-adjacent review: slash
         commands stay for technical/debug actions (/status, /tasks,
-        /weather, ...), plain conversation goes straight to Claude.
+        /weather, ...), plain conversation goes to the AI Manager.
 
-        This is intentionally NOT yet the Phase 7 AI Manager: it does
-        not look anything up in the database or decide which agent's
-        data is relevant. It's a plain chat passthrough - whatever the
-        user typed goes to the model as-is, and if the user asks "what's
-        up today", the model answers as a generic assistant, honestly,
-        not pretending it has looked anything up. Real tool-calling
-        routing to get_tasks()/get_weather()/get_valorant() belongs in
-        Phase 7.
+        When ``self.ai_manager`` is None (no LLM_API_KEY configured, so
+        run.py never built one - see run.py), this falls back to the
+        original plain passthrough (get_provider()/provider.generate()
+        directly) so the "no key" experience is unchanged and this
+        method never requires an AIManager to be constructed just to be
+        called (kept exactly as-is for backward compatibility - spec
+        §80 - rather than swapping in a fake/minimal AIManager here).
         """
         question = update.message.text
         if not question or not question.strip():
             return
 
+        if self.ai_manager is None:
+            await self._chat_without_ai_manager(question, update)
+            return
+
+        try:
+            # A copy, not a reference - self._chat_history is mutated
+            # right below on success, and AIManager itself also mutates
+            # its own local `messages` list built from `history` (see
+            # agents/ai_manager/agent.py's handle_message()); neither
+            # mutation should ever alias this handler's own list.
+            result = await self.ai_manager.handle_message(
+                question, history=list(self._chat_history)
+            )
+        except Exception:  # noqa: BLE001 - never let AI Manager/provider/tool failures crash the bot
+            logger.exception("AI Manager failed while answering a chat message")
+            await update.message.reply_text(
+                "⚠️ Не удалось получить ответ. Подробности в логах."
+            )
+            return
+
+        # spec §61-62 - correlate this turn's outcome without logging its
+        # actual (potentially sensitive - user's own study data) content.
+        logger.info(
+            "AI Manager [%s]: status=%s tool_calls=%d",
+            result.request_id, result.status, len(result.tool_calls),
+        )
+
+        if result.status == "OK":
+            # Only a successful turn extends the remembered dialogue -
+            # a provider/timeout/max-iterations failure's half-formed
+            # exchange shouldn't poison the next turn's context.
+            self._chat_history.append({"role": "user", "content": question})
+            self._chat_history.append({"role": "assistant", "content": result.text})
+            if len(self._chat_history) > _MAX_HISTORY_MESSAGES:
+                self._chat_history = self._chat_history[-_MAX_HISTORY_MESSAGES:]
+
+        await update.message.reply_text(result.text)
+
+    async def _chat_without_ai_manager(self, question: str, update: Update) -> None:
+        """Original Phase-5 plain LLM passthrough - preserved as the
+        fallback for when no AIManager was configured (see chat())."""
         provider = get_provider(self.config)
         if isinstance(provider, NullProvider):
             await update.message.reply_text(

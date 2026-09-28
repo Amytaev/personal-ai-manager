@@ -27,17 +27,20 @@ from agents.checker.agent import CheckerAgent
 from agents.runner import run_and_record
 from agents.sso.agent import SsoAgent
 from agents.sso.auth import SsoSession
+from agents.ai_manager.agent import AIManager
 from agents.study_manager.agent import StudyManager
 from agents.teams.agent import TeamsAgent
 from agents.teams.auth import TeamsSession
 from agents.valorant.agent import ValorantAgent
 from agents.weather import WeatherAgent
 from config import load_config
+from llm.provider import get_provider
 from logging_config import setup_logging
 from scheduler.scheduler import Scheduler, SingleInstanceError, SingleInstanceGuard
 from storage.database import Database
 from storage.wishlist import WishlistStore
 from telegram_bot.bot import TelegramBot
+from tools.registry import build_default_registry
 
 logger = logging.getLogger(__name__)
 
@@ -335,7 +338,19 @@ async def main() -> None:
             await _weather_cycle(weather_agent, db)
 
         if config.telegram_bot_token and config.telegram_chat_id:
-            bot = TelegramBot(config=config, db=db, wishlist=wishlist)
+            # AI Manager ТЗ v3 §43/§95 (Этап O) - only wire up a real
+            # AIManager when an LLM key is actually configured; otherwise
+            # leave it None so Handlers.chat() keeps showing the existing
+            # "LLM не настроен" message instead of an AIManager that can
+            # never call its provider. build_default_registry() reuses
+            # the SAME study_manager_agent instance already constructed
+            # and registered above - never a second one.
+            ai_manager = None
+            if config.llm_api_key:
+                provider = get_provider(config)
+                tool_registry = build_default_registry(db, study_manager_agent)
+                ai_manager = AIManager(provider, tool_registry)
+            bot = TelegramBot(config=config, db=db, wishlist=wishlist, ai_manager=ai_manager)
             await bot.start()
         else:
             logger.warning(

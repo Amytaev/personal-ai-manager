@@ -105,3 +105,26 @@ async def test_notify_does_not_mark_notified_when_send_fails(bot):
     # Because the send failed, this must NOT be marked as notified - a
     # future successful attempt should still go through.
     assert bot.db.was_notified("agent_status_change", "teams:failing") is False
+
+
+def test_ai_manager_is_optional_and_defaults_to_none_on_handlers(bot):
+    # No ai_manager was passed to the `bot` fixture above - the Telegram
+    # Adapter (AI Manager ТЗ v3 §43/§95) must degrade to the pre-existing
+    # plain-passthrough chat() behavior rather than requiring every
+    # caller (including this whole pre-existing test file) to construct
+    # a full AIManager just to build a TelegramBot.
+    assert bot.handlers.ai_manager is None
+
+
+def test_ai_manager_is_passed_through_to_handlers(tmp_db, tmp_path):
+    from unittest.mock import MagicMock
+
+    from telegram_bot.bot import TelegramBot
+
+    wishlist = WishlistStore(tmp_path / "wishlist.json")
+    fake_ai_manager = MagicMock()
+    bot_with_ai_manager = TelegramBot(
+        config=_config(tmp_path), db=tmp_db, wishlist=wishlist, ai_manager=fake_ai_manager
+    )
+
+    assert bot_with_ai_manager.handlers.ai_manager is fake_ai_manager
