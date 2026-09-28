@@ -39,6 +39,17 @@ from config import load_config
 # live under these, not under teams.microsoft.com itself.
 _RELEVANT_DOMAIN_SUBSTRINGS = ("microsoftonline.com", "microsoft.com", "live.com", "msauth")
 
+# Duplicated from agents/teams/agent.py (see agents/teams/auth.py's own
+# copy of this same constant for the full reasoning) - kept in sync with
+# the SECOND round of this exact bug class, found 2026-09-29: this
+# script's networkidle-only wait (15s) is shorter than the real agent's
+# total wait (networkidle + this button, ~30s), so it could report
+# "looks logged in: True" moments before a real TeamsAgent run correctly
+# detected the same session as expired - same false-positive shape as
+# the wait_for_url() bug this file's docstring already documents, just
+# one level further down the fix.
+_ASSIGNMENTS_BUTTON_NAME = "Задания"
+
 
 async def _inspect(session: TeamsSession, *, headless: bool, label: str) -> None:
     context = await session._ensure_context(headless=headless)  # noqa: SLF001 - diagnostic script
@@ -55,8 +66,21 @@ async def _inspect(session: TeamsSession, *, headless: bool, label: str) -> None
         except Exception:  # noqa: BLE001 - handled by reporting page.url below either way
             pass
 
+        # Live bug, 2026-09-29: give a slow-but-real redirect the SAME
+        # total wall-clock time agents/teams/agent.py's real fetch gets
+        # (networkidle + this 15s), not just the first half of it - see
+        # this file's docstring and agents/teams/auth.py's
+        # is_logged_in() docstring for the full story.
+        try:
+            await page.get_by_role(
+                "button", name=_ASSIGNMENTS_BUTTON_NAME
+            ).first.wait_for(state="visible", timeout=15_000)
+            button_visible = True
+        except Exception:  # noqa: BLE001 - handled by reporting page.url below either way
+            button_visible = False
+
         final_url = page.url
-        looks_logged_in = LOGGED_IN_URL_HINT in final_url
+        looks_logged_in = button_visible or LOGGED_IN_URL_HINT in final_url
 
         cookies = await context.cookies()
         relevant = [
@@ -66,7 +90,8 @@ async def _inspect(session: TeamsSession, *, headless: bool, label: str) -> None
 
         print(f"\n--- {label} (headless={headless}) ---")
         print(f"Final URL: {final_url}")
-        print(f"Looks logged in (matches {LOGGED_IN_URL_HINT!r}): {looks_logged_in}")
+        print(f"'{_ASSIGNMENTS_BUTTON_NAME}' button visible: {button_visible}")
+        print(f"Looks logged in (button visible OR matches {LOGGED_IN_URL_HINT!r}): {looks_logged_in}")
         print(f"Relevant cookie count: {len(relevant)}")
         for c in relevant:
             # Name + domain + expiry only - NEVER the value, that's a live

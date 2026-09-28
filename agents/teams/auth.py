@@ -35,6 +35,14 @@ TEAMS_URL = "https://teams.microsoft.com/v2/"
 # See the module docstring: unverified guess, to be corrected with real
 # data from scripts/teams_login_setup.py.
 LOGGED_IN_URL_HINT = "teams.microsoft.com/v2/"
+# Duplicated from agents/teams/agent.py's _ASSIGNMENTS_BUTTON_NAME (this
+# project's established "small constant duplicated across a module
+# boundary" call, see agents/study_manager/logic.py's docstring for the
+# same reasoning) - agent.py already imports this module, so importing
+# back the other way would be circular. Used by is_logged_in() below -
+# see its docstring for why this module needs the same signal
+# TeamsAgent's own real fetch already uses, not just a URL check.
+_ASSIGNMENTS_BUTTON_NAME = "Задания"
 
 
 class TeamsLoginTimeout(RuntimeError):
@@ -112,6 +120,27 @@ class TeamsSession:
         (giving any client-side redirect real wall-clock time to actually
         happen) before reading page.url, instead of an instant, always-
         true URL comparison.
+
+        Second live bug, same root cause, found 2026-09-29: even with
+        the networkidle fix above, this method STILL gave false
+        positives - Auth Checker (and scripts/teams_login_setup.py's own
+        "headless re-check", which calls this exact method) reported the
+        session as fine mere seconds before a real TeamsAgent run hit the
+        genuine blank Microsoft sign-in form on the SAME profile, even
+        right after a fresh interactive login. Root cause: Teams is a
+        heavy SPA with constant background traffic (websockets,
+        telemetry), so "networkidle" (500ms of NO network activity) can
+        legitimately never fire within the 15s timeout even while
+        everything is working normally - and MSAL's own client-side
+        redirect-to-login can take longer than that 15s to actually
+        happen. agents/teams/agent.py's _fetch_all_assignments() never
+        had this problem because it waits ANOTHER 15s (up to 30s total)
+        for the "Задания" button to become visible before deciding -
+        this method only had the first 15s, so it read page.url up to
+        15s too early relative to the real agent. Fixed by waiting for
+        the exact same signal TeamsAgent's own (already correct) check
+        uses, giving a slow-but-real redirect the same total wall-clock
+        time here that it already gets there.
         """
         context = await self._ensure_context(headless=True)
         page = await context.new_page()
@@ -121,7 +150,21 @@ class TeamsSession:
                 await page.wait_for_load_state("networkidle", timeout=15_000)
             except Exception:  # noqa: BLE001 - proceed with whatever state exists either way
                 pass
-            return LOGGED_IN_URL_HINT in page.url
+            try:
+                # If the assignments button shows up, the session is
+                # definitely valid - no need to also check the URL.
+                await page.get_by_role(
+                    "button", name=_ASSIGNMENTS_BUTTON_NAME
+                ).first.wait_for(state="visible", timeout=15_000)
+                return True
+            except Exception:  # noqa: BLE001 - Playwright's own TimeoutError, same as agent.py
+                # The button never appeared even after the SAME total
+                # ~30s of real wall-clock time TeamsAgent's own fetch
+                # gets - page.url now decides between "genuinely logged
+                # out" (redirect completed) and "logged in but the UI
+                # changed" (unrelated to auth), exactly like agent.py's
+                # own fallback.
+                return LOGGED_IN_URL_HINT in page.url
         finally:
             await page.close()
 

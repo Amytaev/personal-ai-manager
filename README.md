@@ -1308,6 +1308,36 @@ refresh теперь пишет в `agent_runs`, поэтому `last_data_sync`
 `agent_runs`/`last_successful_agent_run()` — и для успешного, и для
 упавшего запуска.
 
+**Четвёртый живой баг, тот же день (2026-09-29): `is_logged_in()`
+(Auth Checker и `teams_login_setup.py`'s "headless re-check") давал
+ложные "сессия ОК" даже сразу после свежего логина** — обнаружено при
+живой отладке с пользователем: интерактивный логин через
+`scripts/teams_login_setup.py` проходил успешно, его собственная
+headless-перепроверка (тот же `is_logged_in()`) говорила "всё ок", а
+следующий же реальный прогон `TeamsAgent` упирался в настоящую пустую
+форму логина Microsoft — стабильно, при каждой попытке. `is_logged_in()`
+ждёт `page.wait_for_load_state("networkidle", timeout=15_000)` и сразу
+после читает `page.url` — но Teams это тяжёлое SPA с постоянным фоновым
+трафиком (вебсокеты, телеметрия), поэтому `networkidle` (500мс БЕЗ
+сетевой активности) может вообще не наступить за 15 секунд даже в
+абсолютно нормальной ситуации, а собственный клиентский редирект MSAL на
+логин может занять больше этих 15 секунд. `agents/teams/agent.py`'s
+`_fetch_all_assignments()` никогда не страдал от этого — он ПОСЛЕ того
+же networkidle-ожидания ещё до 15 секунд ждёт появления кнопки "Задания"
+(итого до ~30 секунд реального времени на редирект), а `is_logged_in()`
+имел только первую половину этого окна и читал `page.url` слишком рано.
+
+Исправлено — `is_logged_in()` теперь ждёт **тот же** сигнал, что и
+настоящий агент: появление кнопки "Задания" (до 15с, тем же способом
+`page.get_by_role("button", name="Задания").first.wait_for(...)`), и
+только если она так и не появилась — откатывается на проверку
+`page.url` (как раньше). Та же более короткая проверка была и в
+диагностическом `scripts/teams_diagnose_reauth.py` — поправлена
+аналогично, для консистентности. 6 новых тестов в
+`tests/test_teams_auth.py`, включая прямое воспроизведение живого
+симптома (URL ещё "совпадает", кнопка так и не появилась — раньше это
+считалось бы "залогинен", что и вводило в заблуждение).
+
 **Telegram Adapter** (§43, Этап O — `telegram_bot/handlers.py`'s
 `Handlers.chat()`, `telegram_bot/bot.py`, `run.py`) — отдельный слой
 между Telegram и AI Manager, как и требует спека: `TelegramBot`/
@@ -1354,15 +1384,17 @@ planner, одновременная поддержка нескольких LLM 
 
 ## Тесты
 
-**391 тест, все проходят** (366 было до Telegram Adapter + 8 на
+**394 теста, все проходят** (366 было до Telegram Adapter + 8 на
 `Handlers.chat()` с `ai_manager`/на `TelegramBot`'s опциональный
 `ai_manager` — история диалога, fallback без `LLM_API_KEY`, honest
 error handling при упавшем `handle_message()` + 7 на
 `last_data_sync`/`last_data_status` — сессия-валидность vs реальный
 сбор данных + 6 на `normalize_class_type()`/`expand_weekly_schedule()`
 + 3 на честную обработку `FAILING`-результата (без исключения) и запись
-`agent_runs` при ручном refresh — три живых бага из первого реального
-прогона, см. AI Manager / Telegram Adapter выше): 56 из Phase 2-4 (core infra, БД,
+`agent_runs` при ручном refresh + 3 новых/обновлённых на
+`is_logged_in()`'s ожидание кнопки "Задания" — четыре живых бага из
+первого реального прогона, см. AI Manager / Telegram Adapter выше): 56
+из Phase 2-4 (core infra, БД,
 scheduler/retry, Weather Agent, Telegram auth/wishlist, LLM provider —
 включая 4 для чата с Claude, `Handlers.chat`) + 43 из Phase 5 (18 для
 Teams-парсера, 8 для `TeamsSession` (включая 2 на исправленный
