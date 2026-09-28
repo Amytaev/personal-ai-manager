@@ -1280,6 +1280,34 @@ lab/practice; добавлены прямые unit-тесты на все чет
 `get_upcoming_schedule()`) на лекционной строке — тот самый сценарий,
 который упал в проде.
 
+**Третий живой баг, тот же день (2026-09-29): ручной "обнови задания"
+в Telegram отвечал "Teams — синхронизация успешна" сразу после
+реального падения Teams** — причина в `refresh()`'s
+`_run_step()` (`agents/study_manager/agent.py`): он вызывал
+`await agent.run()` напрямую и реагировал ТОЛЬКО на реально выброшенное
+исключение. Но контракт `BaseAgent` (см. `agents/base.py`) — обратный:
+ожидаемый сбой (протухшая сессия, не загрузилась страница) агент обязан
+поймать сам и вернуть `AgentResult(status=FAILING)`, никогда не
+бросать исключение. `TeamsAgent.run()` именно так себя и вёл — падение
+полностью проглатывалось, `refresh()` считал `teams_status` только по
+`source_status` (тому самому Auth Checker'у, см. баг выше) и честно (по
+своим данным) рапортовал "успешно". Дополнительно — `_run_step()` вовсе
+не писал в `agent_runs`, так что ручной refresh через Telegram не
+двигал `last_data_sync`/`last_data_status` (см. баг выше) — их обновляли
+только отдельные плановые джобы в `run.py`.
+
+Исправление — `_run_step()` теперь вызывает `agents.runner.run_and_record()`
+(тот же путь, что и плановые джобы `run.py`) вместо голого `agent.run()`,
+и явно проверяет `result.status`: `FAILING` добавляется в `errors`
+наравне с реально выброшенным исключением — значит `overall_status`
+теперь честно становится `ERROR`, а не молча `OK`. Заодно и ручной
+refresh теперь пишет в `agent_runs`, поэтому `last_data_sync`
+обновляется и при "обнови задания" в Telegram, а не только по расписанию.
+3 новых теста: `FAILING`-результат без исключения корректно учитывается
+в `errors`/`status`, ручной `refresh()` реально пишет
+`agent_runs`/`last_successful_agent_run()` — и для успешного, и для
+упавшего запуска.
+
 **Telegram Adapter** (§43, Этап O — `telegram_bot/handlers.py`'s
 `Handlers.chat()`, `telegram_bot/bot.py`, `run.py`) — отдельный слой
 между Telegram и AI Manager, как и требует спека: `TelegramBot`/
@@ -1326,14 +1354,15 @@ planner, одновременная поддержка нескольких LLM 
 
 ## Тесты
 
-**388 тестов, все проходят** (366 было до Telegram Adapter + 8 на
+**391 тест, все проходят** (366 было до Telegram Adapter + 8 на
 `Handlers.chat()` с `ai_manager`/на `TelegramBot`'s опциональный
 `ai_manager` — история диалога, fallback без `LLM_API_KEY`, honest
 error handling при упавшем `handle_message()` + 7 на
 `last_data_sync`/`last_data_status` — сессия-валидность vs реальный
 сбор данных + 6 на `normalize_class_type()`/`expand_weekly_schedule()`
-- два живых бага из первого реального прогона, см. AI Manager /
-Telegram Adapter выше): 56 из Phase 2-4 (core infra, БД,
++ 3 на честную обработку `FAILING`-результата (без исключения) и запись
+`agent_runs` при ручном refresh — три живых бага из первого реального
+прогона, см. AI Manager / Telegram Adapter выше): 56 из Phase 2-4 (core infra, БД,
 scheduler/retry, Weather Agent, Telegram auth/wishlist, LLM provider —
 включая 4 для чата с Claude, `Handlers.chat`) + 43 из Phase 5 (18 для
 Teams-парсера, 8 для `TeamsSession` (включая 2 на исправленный

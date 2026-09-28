@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from agents.base import AgentResult, AgentStatus, BaseAgent
+from agents.runner import run_and_record
 from agents.study_manager import logic
 from storage.database import Database
 
@@ -181,8 +182,32 @@ class StudyManager(BaseAgent):
         }
 
     async def _run_step(self, name: str, agent: BaseAgent, errors: list[str]) -> None:
+        """Live bug, 2026-09-29: this used to call ``await agent.run()``
+        directly and only react to a RAISED exception. But every source
+        agent's own contract (agents/base.py's BaseAgent docstring) is
+        the opposite - an *expected* failure (auth expired, page didn't
+        load) must be CAUGHT internally and returned as a FAILING
+        AgentResult, never raised. So a manual "обнови задания" refresh
+        (this method, via the refresh_study_data tool) silently
+        swallowed a real TeamsAgent failure and went on to report
+        "Teams — синхронизация успешна" from source_status's (stale/
+        differently-sourced, see get_source_status()'s own docstring)
+        OK status - a live example of the exact thing the AI Manager
+        spec's anti-hallucination rule forbids, just one layer further
+        down than the LLM itself.
+
+        Two fixes at once: (1) route through agents.runner.run_and_record()
+        instead of a bare agent.run() so a MANUAL refresh (this path)
+        writes to agent_runs exactly like the SCHEDULED run.py jobs
+        already do - without this, last_successful_agent_run()/
+        get_source_status()'s last_data_sync/last_data_status (added
+        for the earlier live bug) would never move on a manual refresh
+        at all; (2) inspect the returned AgentResult and treat a FAILING
+        status the same as a raised exception - appended to ``errors``,
+        which is what makes refresh()'s overall_status honestly reflect
+        a failed sync instead of silently reporting OK."""
         try:
-            await agent.run()
+            result = await run_and_record(agent, self.db)
         except Exception as exc:  # noqa: BLE001 - per-source isolation boundary, spec §28
             # Exception TYPE + message only (no secrets ever end up in an
             # exception message this project's own agents raise, but
@@ -191,6 +216,11 @@ class StudyManager(BaseAgent):
             # traceback, never raw request/response data.
             logger.warning("Study Manager: %s raised %s: %s", name, type(exc).__name__, exc)
             errors.append(f"{name}: {type(exc).__name__}: {exc}")
+            return
+
+        if result.status == AgentStatus.FAILING:
+            logger.warning("Study Manager: %s run ended in failing: %s", name, result.error)
+            errors.append(f"{name}: {result.error or 'run ended in failing'}")
 
     # -- reads (spec §25/§27 - SQLite only, never a browser/network) ------
 

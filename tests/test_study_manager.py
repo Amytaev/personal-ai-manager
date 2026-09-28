@@ -57,11 +57,28 @@ class _StubAgent(BaseAgent):
     integration tests - records that it ran, and can be told to raise
     (spec §28's "one source's exception must not take down the rest")."""
 
-    def __init__(self, name: str, *, raises: Exception | None = None, on_run=None):
+    def __init__(
+        self,
+        name: str,
+        *,
+        raises: Exception | None = None,
+        on_run=None,
+        result_status: AgentStatus = AgentStatus.WORKING,
+        result_error: str | None = None,
+    ):
         super().__init__(name=name)
         self.raises = raises
         self.on_run = on_run
         self.call_count = 0
+        # spec's BaseAgent contract (agents/base.py): an EXPECTED failure
+        # (auth expired, page didn't load) must be caught internally and
+        # returned as a FAILING AgentResult, never raised - `raises` above
+        # simulates the other, unexpected-crash case. Both must be
+        # handled the same way by refresh()'s _run_step (live bug,
+        # 2026-09-29 - see agents/study_manager/agent.py's docstring on
+        # _run_step for the real production incident this reproduces).
+        self.result_status = result_status
+        self.result_error = result_error
 
     async def run(self) -> AgentResult:
         self.call_count += 1
@@ -69,7 +86,7 @@ class _StubAgent(BaseAgent):
             raise self.raises
         if self.on_run is not None:
             self.on_run()
-        return AgentResult(agent=self.name, status=AgentStatus.WORKING, data={})
+        return AgentResult(agent=self.name, status=self.result_status, error=self.result_error, data={})
 
 
 # ===========================================================================
@@ -385,6 +402,68 @@ async def test_sso_failure_still_returns_teams_data(tmp_db):
     assert any("sso" in e for e in result["errors"])
     assert result["teams_status"] == "OK"
     assert result["status"] == StudyManagerStatus.ERROR.value  # an internal exception did happen
+
+
+# ===========================================================================
+# 7b. Live bug, 2026-09-29: an EXPECTED failure (FAILING AgentResult,
+# never raised - e.g. TeamsAgent's session-expired case) must be
+# treated the same as a raised exception by refresh(), and a manual
+# refresh (the refresh_study_data tool, i.e. Telegram "обнови задания")
+# must actually record agent_runs like a scheduled run.py job does -
+# in production this silently reported "Teams — синхронизация успешна"
+# right after a real Teams failure, because _run_step only reacted to a
+# raised exception and never recorded anything to agent_runs at all.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_refresh_treats_an_expected_failing_result_as_an_error_without_raising(tmp_db):
+    # This is the REAL shape of a Teams session-expired failure - no
+    # exception is raised (agents/base.py's BaseAgent contract requires
+    # catching expected failures), just a FAILING AgentResult.
+    teams = _StubAgent(
+        "teams", result_status=AgentStatus.FAILING, result_error="Teams session looks expired"
+    )
+    sm = StudyManager(db=tmp_db, teams_agent=teams)
+    result = await sm.refresh()
+
+    assert teams.call_count == 1
+    assert any("teams" in e and "session looks expired" in e for e in result["errors"])
+    # A silent "success" here is exactly the live bug - a failed source
+    # run must make the overall result honestly reflect the failure.
+    assert result["status"] == StudyManagerStatus.ERROR.value
+
+
+@pytest.mark.asyncio
+async def test_refresh_records_agent_runs_so_a_manual_refresh_updates_last_data_sync(tmp_db):
+    """Ties together both 2026-09-29 fixes: get_source_status()'s
+    last_data_sync (added for the Auth Checker vs real-fetch mixup) must
+    actually move when the user says "обнови задания" in Telegram - not
+    just on run.py's own separately-scheduled teams_check/sso_check
+    jobs."""
+    teams = _StubAgent("teams")
+    sm = StudyManager(db=tmp_db, teams_agent=teams)
+    assert tmp_db.last_successful_agent_run("teams") is None  # nothing recorded yet
+
+    await sm.refresh()
+
+    row = tmp_db.last_successful_agent_run("teams")
+    assert row is not None
+    assert row["status"] == "working"
+
+
+@pytest.mark.asyncio
+async def test_refresh_records_a_failing_manual_run_in_agent_runs_too(tmp_db):
+    teams = _StubAgent("teams", result_status=AgentStatus.FAILING, result_error="boom")
+    sm = StudyManager(db=tmp_db, teams_agent=teams)
+
+    await sm.refresh()
+
+    assert tmp_db.last_run("teams") is not None
+    assert tmp_db.last_run("teams")["status"] == "failing"
+    # No WORKING/DEGRADED run ever happened, so there is honestly no
+    # successful data sync to report.
+    assert tmp_db.last_successful_agent_run("teams") is None
 
 
 # ===========================================================================
