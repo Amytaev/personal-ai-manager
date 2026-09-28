@@ -297,6 +297,122 @@ class StudyManager(BaseAgent):
             result.append(finding)
         return result
 
+    # -- Study Overrides (AI Manager ТЗ v3 §12-23) - local writes only ----
+    #
+    # Every method below touches ONLY storage/database.py's
+    # study_overrides table - never tasks/sso_courses/
+    # sso_schedule_entries/sso_study_materials (Source Data, spec §4's
+    # "READ-ONLY" side). This is the one place in this whole project
+    # where a "write" tool exists for AI Manager to call, and it is
+    # deliberately narrow: a fixed allowlist of fields (agents/
+    # study_manager/logic.py's ALLOWED_OVERRIDE_FIELDS), validated
+    # BEFORE anything reaches SQLite, never a free-form column name.
+
+    def set_task_override(
+        self,
+        task_id: str,
+        field: str,
+        value: Any,
+        *,
+        course_code: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """spec §14/§23 - stores a local correction for one Teams task.
+        Raises logic.OverrideValidationError (never touches SQLite) if
+        ``field`` isn't on the allowlist or ``value`` doesn't fit it -
+        callers (the future AI Manager tool layer) must treat that as
+        an ordinary rejection to relay back to the user, not a crash.
+        Never modifies Teams itself (spec §48's Local Write / External
+        Write split) - only this task's row in study_overrides."""
+        normalized = logic.validate_override_field(field, value)
+        self.db.upsert_override(
+            target_type="task",
+            target_id=str(task_id),
+            field=field,
+            value=normalized,
+            course_code=course_code,
+            reason=reason,
+        )
+        return {"target_type": "task", "target_id": str(task_id), "field": field, "value": normalized}
+
+    def set_activity_override(
+        self,
+        activity_id: str,
+        field: str,
+        value: Any,
+        *,
+        course_code: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """spec §23's set_activity_override(...) - same validation/storage
+        path as set_task_override(), but for a correction that's about a
+        scheduled class occurrence (e.g. a schedule_entry_id) rather
+        than a specific Teams task id. Kept as a distinct method (not a
+        target_type parameter on one shared public method) because the
+        spec names both explicitly as separate public interfaces."""
+        normalized = logic.validate_override_field(field, value)
+        self.db.upsert_override(
+            target_type="activity",
+            target_id=str(activity_id),
+            field=field,
+            value=normalized,
+            course_code=course_code,
+            reason=reason,
+        )
+        return {"target_type": "activity", "target_id": str(activity_id), "field": field, "value": normalized}
+
+    def clear_override(self, target_type: str, target_id: str, field: str | None = None) -> dict[str, Any]:
+        """spec §21 - "верни всё как было в Teams". ``field=None`` clears
+        every active override on that target at once; a specific field
+        clears only that one. Never deletes Source Data (Teams/SSO
+        tables) - only marks this target's own override row(s) inactive
+        (storage/database.py's clear_overrides(), a soft-delete)."""
+        logic.validate_target_type(target_type)
+        cleared = self.db.clear_overrides(target_type=target_type, target_id=str(target_id), field=field)
+        return {"target_type": target_type, "target_id": str(target_id), "field": field, "cleared": cleared}
+
+    def get_overrides(
+        self, *, course_code: str | None = None, target_type: str | None = None
+    ) -> list[dict[str, Any]]:
+        """spec §22 - "какие корректировки я делал". Active overrides
+        only (storage/database.py's default active_only=True) - a
+        cleared override is never shown as if it still applied."""
+        if target_type is not None:
+            logic.validate_target_type(target_type)
+        rows = self.db.get_overrides(target_type=target_type, course_code=course_code)
+        return [self._override_view(row) for row in rows]
+
+    def get_effective_task(self, task_id: str) -> dict[str, Any] | None:
+        """spec §17/§18/§49 - source vs override vs effective for one
+        Teams task. Returns None if no such task exists in storage at
+        all (never fabricates a task to attach an override to - an
+        override can only ever correct a real, already-synced task)."""
+        rows = [dict(row) for row in self.db.get_tasks(source="teams")]
+        match = next((row for row in rows if str(row.get("id")) == str(task_id)), None)
+        if match is None:
+            return None
+        view = logic.task_view(match)
+        override_rows = [
+            self._override_view(row)
+            for row in self.db.get_overrides(target_type="task", target_id=str(task_id))
+        ]
+        return logic.apply_overrides_to_task(view, override_rows)
+
+    @staticmethod
+    def _override_view(row: Any) -> dict[str, Any]:
+        """Converts one raw study_overrides row into a plain dict with
+        ``value`` decoded back out of its stored JSON (see storage/
+        database.py's upsert_override()) - the one place that JSON
+        decode happens, so callers never see value_json directly."""
+        view = dict(row)
+        raw_value = view.pop("value_json", None)
+        try:
+            view["value"] = json.loads(raw_value) if raw_value is not None else None
+        except ValueError:
+            view["value"] = None
+        view["active"] = bool(view.get("active"))
+        return view
+
     def get_dashboard(self) -> dict[str, Any]:
         """spec §26/§34 - one aggregating snapshot, deliberately NOT
         including the (potentially large) materials arrays (§26's "must

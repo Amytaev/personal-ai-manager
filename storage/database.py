@@ -11,7 +11,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 from storage.models import SCHEMA
 
@@ -388,6 +388,105 @@ class Database:
                 "SELECT * FROM checker_findings WHERE course_code = ? ORDER BY window_start",
                 (course_code,),
             ).fetchall()
+
+    # -- study_overrides (AI Manager ТЗ v3 §12-16) ------------------------
+
+    def upsert_override(
+        self,
+        target_type: str,
+        target_id: str,
+        field: str,
+        value: Any,
+        course_code: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Upserts the one active row for (target_type, target_id, field) -
+        a repeated "set" on the same target/field replaces its value in
+        place (via the UNIQUE constraint in storage/models.py) rather
+        than growing a duplicate row, and reactivates it (active=1) if
+        it had previously been cleared. ``field`` is NOT validated here
+        - agents/study_manager/logic.py's validate_override_field() is
+        the single point that enforces the allowlist, called by
+        StudyManager BEFORE this method is ever reached, so a bad field
+        name never gets this far in the first place."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT created_at FROM study_overrides WHERE target_type = ? AND target_id = ? AND field = ?",
+                (target_type, target_id, field),
+            ).fetchone()
+            created_at = existing["created_at"] if existing else now
+            conn.execute(
+                """
+                INSERT INTO study_overrides
+                    (target_type, target_id, course_code, field, value_json,
+                     reason, created_at, updated_at, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(target_type, target_id, field) DO UPDATE SET
+                    course_code=excluded.course_code,
+                    value_json=excluded.value_json,
+                    reason=excluded.reason,
+                    updated_at=excluded.updated_at,
+                    active=1
+                """,
+                (
+                    target_type,
+                    target_id,
+                    course_code,
+                    field,
+                    json.dumps(value, ensure_ascii=False),
+                    reason,
+                    created_at,
+                    now,
+                ),
+            )
+
+    def get_overrides(
+        self,
+        target_type: str | None = None,
+        target_id: str | None = None,
+        course_code: str | None = None,
+        active_only: bool = True,
+    ) -> list[sqlite3.Row]:
+        query = "SELECT * FROM study_overrides WHERE 1=1"
+        params: list[Any] = []
+        if target_type is not None:
+            query += " AND target_type = ?"
+            params.append(target_type)
+        if target_id is not None:
+            query += " AND target_id = ?"
+            params.append(str(target_id))
+        if course_code is not None:
+            query += " AND course_code = ?"
+            params.append(course_code)
+        if active_only:
+            query += " AND active = 1"
+        query += " ORDER BY course_code, target_id, field"
+        with self.connect() as conn:
+            return conn.execute(query, params).fetchall()
+
+    def clear_overrides(self, target_type: str, target_id: str, field: str | None = None) -> int:
+        """Soft-deletes (active=0) either one field's override or, when
+        ``field`` is None, every active override on that target
+        ("верни всё как было в Teams" - spec §21). Never deletes the
+        row outright - see storage/models.py's schema comment on why.
+        Returns how many rows were cleared, so a caller can tell "there
+        was nothing to clear" apart from "cleared 1"."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            if field is None:
+                cur = conn.execute(
+                    "UPDATE study_overrides SET active = 0, updated_at = ? "
+                    "WHERE target_type = ? AND target_id = ? AND active = 1",
+                    (now, target_type, target_id),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE study_overrides SET active = 0, updated_at = ? "
+                    "WHERE target_type = ? AND target_id = ? AND field = ? AND active = 1",
+                    (now, target_type, target_id, field),
+                )
+            return cur.rowcount
 
     # -- notifications (dedup, TZ v4 §20/§22) ----------------------------
 

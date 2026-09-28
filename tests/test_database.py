@@ -16,7 +16,7 @@ def test_schema_creates_all_required_tables(tmp_db):
     required = {
         "tasks", "weather_snapshots", "valorant_store", "notifications", "agent_runs",
         "sso_courses", "sso_schedule_entries", "sso_study_materials", "source_status",
-        "checker_findings",
+        "checker_findings", "study_overrides",
     }
     assert required.issubset(tables)
 

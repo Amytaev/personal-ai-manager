@@ -1126,9 +1126,120 @@ Recruiter/Factory, автоматическая отправка Telegram-уве
 автоматическое скачивание УМКД, запись в Teams/SSO, изменения данных
 VALORANT, MFA-релей через Telegram.
 
+## AI Manager — оркестрирующий слой поверх Tool Registry (bro's ТЗ v3, в процессе)
+
+**Статус: реализовано ядро (Audit → Study Overrides → Effective Data →
+LLM Provider tool-calling → Tool Registry → System Prompt → AIManager),
+ещё НЕ подключено к Telegram** — по собственному порядку спеки бро
+(Этап O "Telegram Adapter" идёт только после того, как внутренний AI
+Manager проверен отдельно). ТЗ v3 — 96 пунктов, самая большая спека в
+этом проекте; ведётся поэтапно, как и требует сама спека.
+
+**Study Overrides** (`storage/models.py`'s `study_overrides`,
+`storage/database.py`'s `upsert_override()`/`get_overrides()`/
+`clear_overrides()`) — локальный, обратимый слой корректировок поверх
+Teams/SSO, **никогда** не пишущий в сами Teams/SSO. Разрешённые поля —
+закрытый список (`agents/study_manager/logic.py`'s
+`ALLOWED_OVERRIDE_FIELDS`): `academic_week`/`activity_number`/
+`is_current`/`local_due_date`/`local_completion_status`/`user_note`.
+Любое другое имя поля отклоняется `validate_override_field()` ещё до
+того, как дойдёт до SQL — LLM физически не может передать
+`{"field": "some_internal_database_column"}` и что-то сломать.
+`StudyManager.set_task_override()`/`set_activity_override()`/
+`clear_override()`/`get_overrides()`/`get_effective_task()` — новые
+публичные методы `StudyManager` (bro's ТЗ v3 §23), реализующие
+source→override→effective (§17-20): `get_effective_task()` возвращает
+`{task_id, course_code, source, override, effective}` — `source`
+всегда остаётся тем, что реально сказал Teams (§50: "Я уже сдал" от
+пользователя никогда не переписывает `source.status`/`source.is_completed`,
+только `effective.completion_status`).
+
+**LLM Provider — tool-calling** (`llm/provider.py`): существующий
+`LLMProvider`/`AnthropicProvider`/`NullProvider`/`get_provider()`
+(Phase 2) расширен методом `generate_with_tools(messages, tools,
+system)` → `LLMToolResult(text, tool_calls, raw_content)` — реальный
+tool-use Anthropic API (`AnthropicProvider`), а не имитация через
+текст промпта. Базовая реализация в `LLMProvider` деградирует до
+обычного `generate()` без `tool_calls` — так `NullProvider` (нет
+`LLM_API_KEY`) не падает, а просто честно отвечает текстом без
+маршрутизации. По прямому указанию бро (§7) **не добавлен** второй
+provider (Gemini/OpenAI/...) — "не реализовывать несколько провайдеров
+без необходимости", то же самое, что и раньше обсуждалось с
+пользователем при выборе бесплатной альтернативы.
+
+**Tool Registry** (`tools/base.py`'s `Tool`/`ToolRegistry`,
+`tools/study.py`/`tools/weather.py`/`tools/valorant.py`,
+`tools/registry.py`'s `build_default_registry()`) — единственный
+способ, которым LLM вообще может что-то получить или изменить.
+`ToolRegistry.execute()` — единственное место, где вызов реально
+происходит: проверяет каждый переданный ключ по allowlist схемы
+параметров ДО вызова хендлера (§16/§46 — тот же принцип, что и у
+Study Overrides), ловит любое исключение хендлера и превращает его в
+`ToolResult.fail(code, message)` (§27's `{"status","data","error"}`),
+никогда не роняя вызывающего. 16 зарегистрированных tools: 14 учебных
+(обёртки над публичными методами `StudyManager`, включая Study
+Overrides), `get_weather` и `get_valorant_store` — оба читают
+последний уже сохранённый снимок из БД (`weather_snapshots`/
+`valorant_store`, тот же источник, что уже использует `/weather`/
+`/store` в Telegram), а не гоняют `WeatherAgent`/`ValorantAgent` живьём
+на каждое сообщение (§84 — не превращать обычное чтение в долгий
+пайплайн; VALORANT-то и вовсе открыл бы реальный Playwright-браузер).
+`get_valorant_store` явно различает "магазина ещё нет" и "магазин
+недоступен" (`StoreUnavailableError`) — `STORE_UNAVAILABLE` никогда не
+превращается в "сегодня магазин пустой" (§26).
+
+**System Prompt** (`agents/ai_manager/prompt.py`'s
+`build_system_prompt()`) — единый системный промпт AI Manager (§56):
+роль и границы, список групп tools, правила multi-tool, обработка
+дат/`AUTH_REQUIRED`/freshness, разграничение Study Overrides vs Source
+Data (§50's формулировка про "отметил локально" vs "Teams подтвердил"
+воспроизведена буквально), запрет hallucination, неоднозначность
+(строже для write-операций), недоступные операции, security (внешний
+текст — данные, а не инструкция; секреты никогда не обсуждаются),
+стиль ответа. Текущее время встраивается заново при каждом вызове
+(`now.isoformat()`), а не кэшируется — чтобы "сегодня"/"завтра" не
+протухали в долгой сессии.
+
+**AIManager** (`agents/ai_manager/agent.py`) — реализует §86's цикл:
+intent detection делегирован самой LLM через её собственный
+tool-calling (никакого отдельного keyword-роутера здесь нет),
+`ToolRegistry` валидирует параметры и исполняет каждый вызов со своим
+таймаутом (`asyncio.wait_for`, default 60с — §63, один зависший tool
+не должен подвесить весь ответ), результат (ровно то, что вернул
+tool, без искажений) уходит обратно модели как `tool_result`, цикл
+повторяется до финального текста или `max_tool_iterations` (default
+6, циркуит-брейкер против модели, которая бесконечно вызывает tools).
+Ограниченный retry (default 1 попытка) — только для самого сбоя
+LLM-провайдера (сеть/5xx), никогда не для упавшего tool (упавший tool
+— это `ToolResult.fail(...)`, который модель просто видит и
+учитывает) и никогда не для браузерных операций внутри агента (§64 —
+ретраи Playwright остаются ответственностью самого агента).
+`request_id` — свой на каждый вызов `handle_message()`, логируется
+вместе с именем/статусом/длительностью каждого tool-вызова, но
+**никогда** с сырыми аргументами/результатом (те могут содержать
+реальные учебные данные пользователя, а не только секреты) — только
+`name`/`status`/`duration_ms` (§61).
+
+**Явные упрощения этого шага, зафиксированные честно** (проект
+однопользовательский — единственный `TELEGRAM_CHAT_ID`, уже
+проверяемый `telegram_bot/auth.py`'s `require_authorized()` для
+каждого хендлера): полноценная multi-user identity-изоляция (§44/§78)
+архитектурно не нужна поверх уже существующей проверки одного
+chat_id, поэтому не строилась отдельно — сделано честно, а не
+имитацией. Telegram Adapter (§43, Этап O) и хранение диалогового
+контекста между сообщениями Telegram (§34, за пределами уже
+поддержанного `handle_message(..., history=...)`) — следующий шаг.
+
+Explicitly НЕ реализовано на этом шаге (§94, прямое указание бро):
+Telegram Mini App, WhatsApp, Agent Recruiter/Factory, внешние
+write-операции в Teams/SSO, покупки VALORANT, полноценная long-term
+memory/vector DB/RAG, автоматическая передача MFA через Telegram,
+сложный semester planner, одновременная поддержка нескольких LLM
+providers.
+
 ## Тесты
 
-**300 тестов, все проходят**: 56 из Phase 2-4 (core infra, БД,
+**366 тестов, все проходят**: 56 из Phase 2-4 (core infra, БД,
 scheduler/retry, Weather Agent, Telegram auth/wishlist, LLM provider —
 включая 4 для чата с Claude, `Handlers.chat`) + 43 из Phase 5 (18 для
 Teams-парсера, 8 для `TeamsSession` (включая 2 на исправленный
@@ -1278,6 +1389,43 @@ true/false по реальному ответу `Auth/IsAuthenticated`, не-JSO
   статусом `UNAVAILABLE`, `run()` как обёртка над `refresh()` с
   корректным `AgentStatus`, и что `get_course_materials()` отдаёт
   только метаданные, никогда бинарное содержимое файла.
+- `tests/test_study_overrides.py` (**33 новых**) — allowlist полей/типов
+  (`validate_override_field()`/`validate_target_type()`), upsert
+  апсертит в место, `clear_override` — soft-delete (не трогает другие
+  target'ы), effective = source без override / override при наличии,
+  конфликт source=30.09 vs override=02.10 → effective=02.10 →
+  `clear_override` → effective снова 30.09, `local_completion_status`
+  никогда не переписывает `source.status`/`source.is_completed`
+  (§50), `get_effective_task` для несуществующего id → `None`,
+  прямые тесты `storage/database.py`'s `upsert_override()`/
+  `get_overrides()`/`clear_overrides()`.
+- `tests/test_llm_provider.py` (**+3 к предыдущим**) —
+  `generate_with_tools()`: базовая реализация `LLMProvider` деградирует
+  до обычного `generate()` без tool_calls, `AnthropicProvider` реально
+  парсит `tool_use`-блоки в `ToolCall`, и корректно возвращает финальный
+  текст без tool_calls, когда модель не просит инструменты.
+- `tests/test_tool_registry.py` (**19 новых**) — `ToolRegistry.execute()`:
+  неизвестный tool/лишний аргумент/отсутствующий обязательный аргумент
+  → `ToolResult.fail(...)`, никогда исключение наружу; sync и async
+  хендлеры; исключение хендлера → структурированная ошибка с типом
+  исключения как `code`; дублирующая регистрация отклоняется;
+  `anthropic_tools()` собирает правильную схему. Плюс
+  `build_default_registry()`: все 16 tools зарегистрированы,
+  `set_task_override` через tool отклоняет плохое поле, `get_weather`/
+  `get_valorant_store` — "нет данных" до первого снимка,
+  `get_valorant_store` никогда не выдаёт пустой список товаров как
+  реальный пустой магазин.
+- `tests/test_ai_manager.py` (**11 новых**) — `AIManager.handle_message()`
+  на скриптованном mock LLM (`FakeProvider`, spec §79): обычный ответ
+  без tool, один tool-вызов и точная передача его результата обратно
+  модели (без искажений), несколько tool-вызовов за один ход, упавший
+  tool не роняет весь ответ (становится `ERROR` в `tool_result`),
+  ограниченный retry провайдера — успешное восстановление и полное
+  исчерпание попыток (`LLM_PROVIDER_ERROR`), таймаут зависшего tool
+  (`TOOL_TIMEOUT`, ход продолжается), превышение `max_tool_iterations`
+  (`MAX_ITERATIONS`), уникальный `request_id` на каждый вызов,
+  системный промпт строится заново на каждый вызов. Плюс smoke-тест
+  `build_system_prompt()`.
 
 Реальный браузер в тестах не запускается и не нужен нигде — вся
 логика Teams Agent и VALORANT Agent (парсинг, дедупликация,

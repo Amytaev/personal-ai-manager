@@ -4,8 +4,10 @@ from datetime import datetime, timezone
 
 import pytest
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
 from config import AppConfig
-from llm.provider import AnthropicProvider, NullProvider, get_provider
+from llm.provider import AnthropicProvider, LLMToolResult, NullProvider, ToolCall, get_provider
 
 
 def _config(**overrides) -> AppConfig:
@@ -64,3 +66,68 @@ async def test_null_provider_does_not_raise():
     provider = NullProvider()
     result = await provider.generate("hello")
     assert "not configured" in result.lower()
+
+
+# -- generate_with_tools() (AI Manager ТЗ v3 §6/§10/§86) --------------------
+
+
+@pytest.mark.asyncio
+async def test_default_generate_with_tools_falls_back_to_plain_text_with_no_tool_calls():
+    # NullProvider never overrides generate_with_tools() - it inherits
+    # LLMProvider's default, which must degrade gracefully (never
+    # invent a fake tool call) when there's no real tool-use support.
+    provider = NullProvider()
+    result = await provider.generate_with_tools(
+        messages=[{"role": "user", "content": "Что у меня завтра?"}],
+        tools=[{"name": "get_upcoming_schedule", "description": "...", "input_schema": {}}],
+    )
+    assert isinstance(result, LLMToolResult)
+    assert result.tool_calls == []
+    assert "not configured" in (result.text or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_provider_generate_with_tools_parses_a_real_tool_use_response():
+    provider = AnthropicProvider(api_key="sk-fake", model="claude-sonnet-5")
+
+    # MagicMock(name=...) sets the mock's own debug name, not a
+    # "name" attribute - the tool's real name has to be assigned after
+    # construction instead.
+    tool_use_block = MagicMock(type="tool_use", id="call_1", input={"days_ahead": 1})
+    tool_use_block.name = "get_upcoming_schedule"
+    fake_response = MagicMock(content=[tool_use_block])
+
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(return_value=fake_response)
+
+    with patch("anthropic.AsyncAnthropic", return_value=fake_client):
+        result = await provider.generate_with_tools(
+            messages=[{"role": "user", "content": "Что у меня завтра?"}],
+            tools=[{"name": "get_upcoming_schedule", "description": "...", "input_schema": {}}],
+            system="You are AI Manager.",
+        )
+
+    assert result.text is None
+    assert result.tool_calls == [ToolCall(id="call_1", name="get_upcoming_schedule", arguments={"days_ahead": 1})]
+    _, kwargs = fake_client.messages.create.call_args
+    assert kwargs["system"] == "You are AI Manager."
+    assert kwargs["tools"][0]["name"] == "get_upcoming_schedule"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_provider_generate_with_tools_returns_final_text_with_no_tool_calls():
+    provider = AnthropicProvider(api_key="sk-fake", model="claude-sonnet-5")
+
+    text_block = MagicMock(type="text", text="Завтра у тебя две пары.")
+    fake_response = MagicMock(content=[text_block])
+
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(return_value=fake_response)
+
+    with patch("anthropic.AsyncAnthropic", return_value=fake_client):
+        result = await provider.generate_with_tools(
+            messages=[{"role": "user", "content": "Что у меня завтра?"}], tools=[],
+        )
+
+    assert result.text == "Завтра у тебя две пары."
+    assert result.tool_calls == []

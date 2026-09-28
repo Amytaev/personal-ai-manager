@@ -154,6 +154,39 @@ CREATE TABLE IF NOT EXISTS checker_findings (
     UNIQUE(course_code, window_start, window_end)
 );
 
+-- Study Overrides (AI Manager ТЗ v3 §12-16) - a user-owned LOCAL
+-- correction layer on top of Teams/SSO's read-only source data (see
+-- agents/study_manager/logic.py's apply_overrides_to_task()). NEVER a
+-- write to Teams/SSO itself - this table exists specifically so a
+-- local correction ("мы сейчас сдаём 3-ю лабу", "я уже сдал") can be
+-- recorded WITHOUT ever touching the source_* tables above.
+-- UNIQUE(target_type, target_id, field) - "set" upserts the one active
+-- row for that (target, field) in place rather than growing a history
+-- table (same "no history table on this first pass" reasoning as
+-- source_status/checker_findings above); `active` is a soft-delete
+-- flag (clear_override() sets it to 0 rather than deleting the row) so
+-- "what did I used to have" stays inspectable if ever needed, while
+-- get_overrides()'s default view only shows active=1 rows.
+-- `field` is validated against agents/study_manager/logic.py's
+-- explicit allowlist (academic_week/activity_number/is_current/
+-- local_due_date/local_completion_status/user_note) BEFORE any row
+-- ever reaches this table - never trust a caller-supplied column name.
+CREATE TABLE IF NOT EXISTS study_overrides (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_type     TEXT NOT NULL,      -- task | activity | course
+    target_id       TEXT NOT NULL,
+    course_code     TEXT,
+    field           TEXT NOT NULL,
+    value_json      TEXT NOT NULL,
+    reason          TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    active          INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(target_type, target_id, field)
+);
+
+CREATE INDEX IF NOT EXISTS idx_study_overrides_target ON study_overrides(target_type, target_id);
+CREATE INDEX IF NOT EXISTS idx_study_overrides_course ON study_overrides(course_code);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_agent_time ON agent_runs(agent, finished_at);
 CREATE INDEX IF NOT EXISTS idx_checker_findings_course ON checker_findings(course_code);
 CREATE INDEX IF NOT EXISTS idx_weather_created ON weather_snapshots(created_at);

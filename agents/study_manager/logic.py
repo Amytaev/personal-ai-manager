@@ -451,3 +451,138 @@ def combine_source_status(teams_status: str | None, sso_status: str | None) -> s
     # Study Manager status = PARTIAL), never OK (spec §19: never report
     # OK when a source needed for the full result is unavailable).
     return StudyManagerStatus.PARTIAL.value
+
+
+# ===========================================================================
+# Study Overrides (AI Manager ТЗ v3 §12-23) - a user-owned LOCAL correction
+# layer, kept entirely separate from Teams/SSO's read-only source data (see
+# storage/models.py's study_overrides table comment). Nothing below ever
+# writes anywhere - these are pure validation/merge functions; agents/
+# study_manager/agent.py's set_task_override()/clear_override()/
+# get_effective_task() are the only things that touch storage/database.py's
+# study_overrides table.
+# ===========================================================================
+
+
+class OverrideValidationError(ValueError):
+    """spec §16's "LLM must not be able to pass an arbitrary field and
+    change it" - raised for any field not on the exact allowlist below,
+    or a value that doesn't fit that field's type. A caller (AI Manager
+    tool layer, StudyManager itself) must treat this as a normal,
+    expected rejection - never let it propagate as an unhandled crash."""
+
+
+ALLOWED_TARGET_TYPES = frozenset({"task", "activity", "course"})
+
+#: spec §14's exact, closed field list - nothing else is ever accepted,
+#: however it's spelled or cased. Extending this list is a deliberate
+#: code change, never a runtime decision.
+ALLOWED_OVERRIDE_FIELDS = frozenset({
+    "academic_week",
+    "activity_number",
+    "is_current",
+    "local_due_date",
+    "local_completion_status",
+    "user_note",
+})
+
+_COMPLETION_STATUSES = frozenset({"UNKNOWN", "IN_PROGRESS", "COMPLETED"})
+
+
+def validate_target_type(target_type: Any) -> str:
+    if target_type not in ALLOWED_TARGET_TYPES:
+        raise OverrideValidationError(
+            f"unknown target_type {target_type!r} - must be one of {sorted(ALLOWED_TARGET_TYPES)}"
+        )
+    return target_type
+
+
+def validate_override_field(field: Any, value: Any) -> Any:
+    """spec §16's allowlist gate, run BEFORE any override ever reaches
+    storage/database.py's upsert_override(). Returns the value in the
+    exact form it should be stored as; raises OverrideValidationError
+    (never a bare crash) for an unknown field or a value that doesn't
+    fit that field's type - an int-shaped field never silently accepts
+    a string, a bool-shaped field never accepts the string "true"."""
+    if field == "academic_week" or field == "activity_number":
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise OverrideValidationError(f"{field} must be a positive integer, got {value!r}")
+        return value
+    if field == "is_current":
+        if not isinstance(value, bool):
+            raise OverrideValidationError(f"is_current must be a boolean, got {value!r}")
+        return value
+    if field == "local_due_date":
+        if parse_iso(value) is None:
+            raise OverrideValidationError(f"local_due_date must be an ISO date/datetime string, got {value!r}")
+        return str(value)
+    if field == "local_completion_status":
+        if value not in _COMPLETION_STATUSES:
+            raise OverrideValidationError(
+                f"local_completion_status must be one of {sorted(_COMPLETION_STATUSES)}, got {value!r}"
+            )
+        return value
+    if field == "user_note":
+        if not isinstance(value, str) or not value.strip():
+            raise OverrideValidationError("user_note must be a non-empty string")
+        return value.strip()
+    raise OverrideValidationError(
+        f"unknown override field {field!r} - must be one of {sorted(ALLOWED_OVERRIDE_FIELDS)}"
+    )
+
+
+def apply_overrides_to_task(task: dict, override_rows: list[dict]) -> dict:
+    """spec §18/§19's {task_id, course_code, source, override, effective}
+    shape for one task_view() dict + its active study_overrides rows
+    (already filtered by the caller to target_type="task",
+    target_id==this task's id - see agents/study_manager/agent.py's
+    get_effective_task()). ``override_rows`` items are dicts with at
+    least "field"/"value" keys (agent.py's _override_view()).
+
+    Precedence (spec §19): an active override always wins for the
+    field it covers; with no override at all for a field, effective ==
+    source for it. spec §50's distinction is preserved explicitly:
+    local_completion_status NEVER overwrites/erases Teams' own
+    ``status``/``is_completed`` in ``source`` - it only changes what
+    ``effective`` says, so a caller can still honestly say "you marked
+    it done, but Teams hasn't registered a submission" (see this
+    project's README for the exact wording bro's spec requires).
+    """
+    by_field = {row["field"]: row["value"] for row in override_rows}
+
+    source = {
+        "due_date": task.get("due_date"),
+        "status": task.get("status"),
+        "is_completed": task.get("is_completed"),
+    }
+    effective: dict[str, Any] = {
+        "due_date": source["due_date"],
+        "completion_status": "COMPLETED" if source["is_completed"] else "NOT_SUBMITTED",
+    }
+    override_out: dict[str, Any] = {}
+
+    if "local_due_date" in by_field:
+        override_out["local_due_date"] = by_field["local_due_date"]
+        effective["due_date"] = by_field["local_due_date"]
+
+    if "local_completion_status" in by_field:
+        override_out["local_completion_status"] = by_field["local_completion_status"]
+        effective["completion_status"] = by_field["local_completion_status"]
+
+    # Passed straight through into `effective` when present - these three
+    # have no equivalent field in Teams' own source data at all (Teams
+    # has no concept of "academic week"/"activity number"/"is this the
+    # one we're currently working on" - see spec §12), so there is
+    # nothing for them to conflict with in `source`.
+    for passthrough_field in ("academic_week", "activity_number", "is_current", "user_note"):
+        if passthrough_field in by_field:
+            override_out[passthrough_field] = by_field[passthrough_field]
+            effective[passthrough_field] = by_field[passthrough_field]
+
+    return {
+        "task_id": task.get("id"),
+        "course_code": task.get("course_code"),
+        "source": source,
+        "override": override_out,
+        "effective": effective,
+    }
