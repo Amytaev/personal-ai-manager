@@ -106,6 +106,16 @@ _LAB_ABBR = ("лаб", "лр")
 _PRACTICE_STEMS = ("практи",)
 _PRACTICE_ABBR = ("пз", "practice")
 _LECTURE_STEMS = ("лекци", "lecture")
+# Live bug, 2026-09-29: this constant was dropped when normalize_class_type()
+# was duplicated from agents/checker/logic.py's normalize_activity_type()
+# (same "small pure list duplicated across a module boundary" call as
+# elsewhere in this project - see that module's docstring), which crashed
+# get_upcoming_schedule()/get_dashboard() with a NameError for any schedule
+# row whose class_type didn't match a lab/practice stem or abbreviation
+# (i.e. most lecture rows). Empty tuple mirrors the original: there is no
+# confirmed short abbreviation for "лекция" worth matching on (unlike "лаб"/
+# "пз"), so a lecture is only ever recognized by its full stem.
+_LECTURE_ABBR: tuple[str, ...] = ()
 
 
 def _contains_any_stem(text: str, stems: tuple[str, ...]) -> bool:

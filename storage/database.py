@@ -59,6 +59,28 @@ class Database:
                 (agent,),
             ).fetchone()
 
+    def last_successful_agent_run(self, agent: str) -> sqlite3.Row | None:
+        """The most recent agent_runs row for ``agent`` that actually did
+        the agent's real job - status "working" or "degraded" (some real
+        data was fetched/processed), never "failing" (bro's live bug,
+        2026-09-28: Auth Checker's is_logged_in() reported teams -> OK a
+        few seconds after the SAME run's actual TeamsAgent.run() had
+        already failed to reach the "Задания" list - is_logged_in() only
+        proves the session/cookie is valid, not that the last real data
+        fetch succeeded, and those two can genuinely disagree in a given
+        cycle). This is the timestamp that answers "when did we last
+        actually get real data from this source", which source_status's
+        own last_successful_sync (an Auth Checker session check, see
+        agents/auth_checker.py) does NOT answer - see
+        agents/study_manager/agent.py's get_source_status() for how the
+        two are combined for a caller."""
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM agent_runs WHERE agent = ? AND status IN ('working', 'degraded') "
+                "ORDER BY finished_at DESC LIMIT 1",
+                (agent,),
+            ).fetchone()
+
     # -- tasks (Teams Agent, Phase 5) ------------------------------------
 
     def get_task_fingerprint(self, task_id: str) -> sqlite3.Row | None:

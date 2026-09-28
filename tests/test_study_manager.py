@@ -18,6 +18,7 @@ from agents.study_manager.logic import (
     filter_upcoming_tasks,
     is_task_completed,
     is_task_overdue,
+    normalize_class_type,
     normalize_course_code,
     normalize_title,
     resolve_course,
@@ -320,6 +321,44 @@ def test_stale_data_is_explicitly_marked_via_source_status_not_hidden(tmp_db):
     assert teams["last_successful_sync"] == "2026-09-01T00:00:00+00:00"
 
 
+def test_get_source_status_distinguishes_session_validity_from_real_data_sync(tmp_db):
+    """Live bug, 2026-09-28: Auth Checker's is_logged_in() reported
+    teams -> OK a few seconds after that SAME source's real TeamsAgent
+    run had already failed to fetch data ("Задания" list never loaded).
+    get_dashboard/get_source_status must expose BOTH signals separately
+    so a caller (AI Manager) can never say "synced just now" based only
+    on the session-validity check."""
+    # Auth Checker's own session check says the session is fine...
+    tmp_db.record_source_status("teams", "OK", "2026-09-28T19:02:33+00:00")
+    # ...but the real TeamsAgent run in that same cycle actually failed,
+    # and its last genuinely successful data fetch was earlier.
+    tmp_db.record_agent_run(
+        "teams", "working", "2026-09-28T10:00:00+00:00", "2026-09-28T10:00:00+00:00", None
+    )
+    tmp_db.record_agent_run(
+        "teams", "failing", "2026-09-28T19:02:51+00:00", "2026-09-28T19:02:51+00:00", "session expired"
+    )
+
+    sm = StudyManager(db=tmp_db)
+    teams = next(r for r in sm.get_source_status() if r["source"] == "teams")
+
+    assert teams["status"] == "OK"
+    assert teams["last_successful_sync"] == "2026-09-28T19:02:33+00:00"
+    # The two fields below are what tell the real story - session is
+    # fine, but the last REAL fetch that actually worked was earlier,
+    # and the most recent attempt outright failed.
+    assert teams["last_data_sync"] == "2026-09-28T10:00:00+00:00"
+    assert teams["last_data_status"] == "failing"
+
+
+def test_get_source_status_reports_none_for_last_data_sync_when_never_successful(tmp_db):
+    tmp_db.record_source_status("teams", "OK", "2026-09-28T00:00:00+00:00")
+    sm = StudyManager(db=tmp_db)
+    teams = next(r for r in sm.get_source_status() if r["source"] == "teams")
+    assert teams["last_data_sync"] is None
+    assert teams["last_data_status"] is None
+
+
 # ===========================================================================
 # 7. Partial failure (2 scenarios)
 # ===========================================================================
@@ -397,6 +436,68 @@ def test_dashboard_never_returns_secret_shaped_fields(tmp_db):
 
 def test_extract_course_code_pulls_code_out_of_teams_display_name():
     assert extract_course_code("CSE4112 Администрирование систем и сетей (Лаб)") == "CSE4112"
+
+
+# ===========================================================================
+# normalize_class_type() - live bug, 2026-09-29: this crashed with
+# NameError: name '_LECTURE_ABBR' is not defined for any schedule row
+# whose class_type wasn't a lab/practice stem or abbreviation (i.e. most
+# lecture rows) - the constant was silently dropped when this function
+# was duplicated from agents/checker/logic.py's normalize_activity_type().
+# It broke get_upcoming_schedule()/get_dashboard() end-to-end in
+# production (a live Telegram AI Manager reply) despite 366+ passing
+# tests, because nothing called this function directly with a
+# non-lab/practice value before. These are the direct unit tests that
+# should have caught it, plus one through expand_weekly_schedule() (what
+# get_upcoming_schedule() actually calls) so a future regression here
+# fails loudly again.
+# ===========================================================================
+
+
+def test_normalize_class_type_recognizes_a_lab_by_stem():
+    assert normalize_class_type("Лабораторная работа") == "LAB"
+
+
+def test_normalize_class_type_recognizes_a_lab_by_abbreviation():
+    assert normalize_class_type("ЛР") == "LAB"
+
+
+def test_normalize_class_type_recognizes_a_practice_by_abbreviation():
+    assert normalize_class_type("ПЗ") == "PRACTICE"
+
+
+def test_normalize_class_type_recognizes_a_lecture_by_stem_and_does_not_crash():
+    # This is the exact shape that crashed in production - a value that
+    # is NOT a lab/practice stem or abbreviation, forcing evaluation of
+    # the (previously undefined) _LECTURE_ABBR branch.
+    assert normalize_class_type("Лекция") == "LECTURE"
+
+
+def test_normalize_class_type_falls_back_to_other_without_crashing():
+    assert normalize_class_type("Семинар") == "OTHER"
+    assert normalize_class_type(None) == "OTHER"
+    assert normalize_class_type("") == "OTHER"
+
+
+def test_expand_weekly_schedule_does_not_crash_on_a_lecture_row():
+    """End-to-end through the actual function get_upcoming_schedule()
+    calls (agents/study_manager/agent.py) - reproduces the live
+    NameError from a real schedule row shape, not just the pure
+    normalize_class_type() unit above."""
+    rows = [{
+        "id": 1,
+        "course_code": "CSE4112",
+        "course_title": "Тест",
+        "class_type": "Лекция",
+        "day_title": "MONDAY_SHORT",
+        "start_time": "09:00",
+        "end_time": "10:20",
+        "instructor_name": "Иванов И.И.",
+        "room_title": "101",
+    }]
+    occurrences = expand_weekly_schedule(rows, days_ahead=7, now=_NOW)
+    assert occurrences  # at least one Monday in the window
+    assert all(o["class_type"] == "LECTURE" for o in occurrences)
 
 
 def test_normalize_course_code_and_title_are_case_and_punctuation_insensitive():

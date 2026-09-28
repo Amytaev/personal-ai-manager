@@ -211,8 +211,34 @@ class StudyManager(BaseAgent):
         """spec §20/§25: every source's status/last_successful_sync/
         last_error, straight from storage/models.py's source_status
         table - the single freshness report a caller needs, without
-        knowing anything about Teams/SSO/Auth Checker internals."""
-        return [dict(row) for row in self.db.get_all_source_status()]
+        knowing anything about Teams/SSO/Auth Checker internals.
+
+        Also merges in ``last_data_sync``/``last_data_status`` from
+        storage/database.py's last_successful_agent_run() - a REAL live
+        bug (2026-09-28) is why these are separate from
+        status/last_successful_sync above: Auth Checker's
+        is_logged_in() check can report a source "OK" (session/cookie
+        valid) within seconds of that SAME source's real agent run
+        (TeamsAgent/SsoAgent) having actually FAILED to fetch data in
+        that same cycle (e.g. the "Задания" list never loaded even
+        though the session itself still looked logged in). Without this
+        field, a caller (AI Manager in particular) can only see the
+        Auth Checker's "OK, synced just now" and has no way to notice
+        the real fetch failed - exactly the kind of "выдай сохранённые
+        данные за только что полученные" the AI Manager spec explicitly
+        forbids (§72-ish/system prompt's freshness section). ``None``
+        for both when that agent has never had a working/degraded run
+        recorded at all yet (honest, not an error)."""
+        rows = [dict(row) for row in self.db.get_all_source_status()]
+        for row in rows:
+            # Only teams/sso have a matching real agent - source_status
+            # deliberately never contains any other source name today,
+            # but this stays defensive rather than assuming.
+            last_data_run = self.db.last_successful_agent_run(row["source"])
+            row["last_data_sync"] = last_data_run["finished_at"] if last_data_run else None
+            latest_run = self.db.last_run(row["source"])
+            row["last_data_status"] = latest_run["status"] if latest_run else None
+        return rows
 
     def get_upcoming_schedule(self, days_ahead: int | None = None) -> list[dict]:
         """spec §13. Empty (not an error) when SSO has never saved a

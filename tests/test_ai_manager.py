@@ -249,3 +249,13 @@ def test_build_system_prompt_covers_the_required_topics():
     # Never embeds a real secret placeholder-looking value.
     assert "sk-" not in prompt
     assert "TELEGRAM_BOT_TOKEN=" not in prompt
+
+
+def test_build_system_prompt_distinguishes_session_validity_from_real_data_sync():
+    """Live bug, 2026-09-28: the model said 'Teams synced just now' from
+    source_status's session-validity check alone, while the real Teams
+    data fetch had actually just failed. The prompt must steer the
+    model toward last_data_sync/last_data_status for that question."""
+    prompt = build_system_prompt()
+    assert "last_data_sync" in prompt
+    assert "last_data_status" in prompt

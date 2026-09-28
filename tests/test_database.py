@@ -31,6 +31,61 @@ def test_record_and_read_agent_run(tmp_db):
     assert last["error"] is None
 
 
+# ===========================================================================
+# last_successful_agent_run() - distinct from source_status's own
+# last_successful_sync (a lightweight Auth Checker session check, see
+# agents/auth_checker.py). This is "when did the real agent (TeamsAgent/
+# SsoAgent/...) last actually fetch data" - the live bug that motivated
+# adding this (2026-09-28): Auth Checker's is_logged_in() can report a
+# source "OK" seconds after that SAME source's real data-fetch run
+# already failed in the same cycle.
+# ===========================================================================
+
+
+def test_last_successful_agent_run_is_none_before_any_run(tmp_db):
+    assert tmp_db.last_successful_agent_run("teams") is None
+
+
+def test_last_successful_agent_run_returns_a_working_run(tmp_db):
+    now = datetime.now(timezone.utc).isoformat()
+    tmp_db.record_agent_run("teams", "working", now, now, None)
+
+    row = tmp_db.last_successful_agent_run("teams")
+    assert row is not None
+    assert row["status"] == "working"
+
+
+def test_last_successful_agent_run_returns_a_degraded_run_too(tmp_db):
+    now = datetime.now(timezone.utc).isoformat()
+    tmp_db.record_agent_run("teams", "degraded", now, now, "partial")
+
+    row = tmp_db.last_successful_agent_run("teams")
+    assert row is not None
+    assert row["status"] == "degraded"
+
+
+def test_last_successful_agent_run_ignores_a_failing_run(tmp_db):
+    now = datetime.now(timezone.utc).isoformat()
+    tmp_db.record_agent_run("teams", "failing", now, now, "boom")
+
+    assert tmp_db.last_successful_agent_run("teams") is None
+
+
+def test_last_successful_agent_run_keeps_the_older_success_when_the_latest_run_failed(tmp_db):
+    earlier = "2026-09-28T10:00:00+00:00"
+    later = "2026-09-28T12:00:00+00:00"
+    tmp_db.record_agent_run("teams", "working", earlier, earlier, None)
+    tmp_db.record_agent_run("teams", "failing", later, later, "session expired")
+
+    # This is exactly the live scenario: the real fetch failed just now,
+    # but there WAS a genuinely successful fetch earlier - that's what
+    # get_source_status()'s last_data_sync must surface, not None and
+    # not the failed run's timestamp.
+    row = tmp_db.last_successful_agent_run("teams")
+    assert row is not None
+    assert row["finished_at"] == earlier
+
+
 def test_notification_dedup_prevents_duplicate_sends(tmp_db):
     assert tmp_db.was_notified("task_overdue", "task-123") is False
 
